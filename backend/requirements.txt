@@ -1,0 +1,16 @@
+Django>=4.2
+djangorestframework
+django-cors-headers
+psycopg2-binary
+djangorestframework-simplejwt
+qrcode
+django-environ
+gunicorn
+dj-database-url
+whitenoise
+Pillow
+daphne>=4.0.0
+channels
+channels-redis
+daphne
+html5-qrcode
