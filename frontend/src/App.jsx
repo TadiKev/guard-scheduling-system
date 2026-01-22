@@ -7,7 +7,6 @@ import AuthContext from "./AuthContext";
   Pages & components. Keep these file paths consistent with your project structure.
 */
 import Login from "./pages/Login";
-import Dashboard from "./pages/Dashboard";
 import Allocation from "./pages/Allocation";
 import Attendance from "./pages/Attendance";
 import Patrol from "./pages/Patrol";
@@ -19,6 +18,9 @@ import AssignmentNotifier from "./components/AssignmentNotifier";
 
 /* Guard dashboard (guard-only) */
 import GuardDashboard from "./pages/GuardDashboard";
+
+/* Admin dashboard (admin-only) */
+import Dashboard from "./pages/Dashboard";
 
 /* --- Small UI helpers --- */
 function LoadingScreen() {
@@ -39,12 +41,12 @@ function NavBar() {
   const linkClass = ({ isActive }) =>
     `px-3 py-2 rounded-md text-sm ${isActive ? "bg-slate-100 text-slate-900 font-semibold" : "text-slate-600 hover:text-slate-900"}`;
 
-  return (
-    <header className="bg-white shadow-sm sticky top-0 z-40">
-      <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
-        <div className="flex items-center justify-between h-16">
-          {/* Left: Brand */}
-          <div className="flex items-center gap-3">
+  // Minimal header when not authenticated
+  if (!token) {
+    return (
+      <header className="bg-white shadow-sm sticky top-0 z-40">
+        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+          <div className="flex items-center justify-between h-16">
             <Link to="/" className="flex items-center gap-3">
               <div className="rounded p-1 bg-gradient-to-r from-emerald-500 to-cyan-400">
                 <div className="px-2 py-1 text-white font-bold text-sm">SG</div>
@@ -54,48 +56,88 @@ function NavBar() {
                 <div className="text-xs text-slate-400">Allocation & Shift Management</div>
               </div>
             </Link>
+            <div className="flex items-center gap-3">
+              <Link to="/login" className="ml-2 px-3 py-2 rounded bg-emerald-600 text-white text-sm">Login</Link>
+            </div>
+          </div>
+        </div>
+      </header>
+    );
+  }
+
+  const isAdmin = Boolean(user?.is_admin);
+  const isGuard = Boolean(user?.is_guard);
+
+  return (
+    <header className="bg-white shadow sticky top-0 z-40">
+      <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+        <div className="flex items-center justify-between h-16">
+          {/* Left: Brand + role badge */}
+          <div className="flex items-center gap-3">
+            <Link to="/" className="flex items-center gap-3">
+              <div className="rounded-md p-1 bg-gradient-to-r from-emerald-500 to-cyan-400 shadow">
+                <div className="px-2 py-1 text-white font-bold text-sm">SG</div>
+              </div>
+              <div>
+                <div className="text-lg font-bold text-slate-800">Smart Guards</div>
+                <div className="text-xs text-slate-400">Allocation & Shift Management</div>
+              </div>
+            </Link>
+            <div className="ml-3">
+              <span className={`inline-flex items-center px-2 py-0.5 rounded text-xs font-medium ${isAdmin ? "bg-indigo-100 text-indigo-800" : isGuard ? "bg-emerald-100 text-emerald-800" : "bg-slate-100 text-slate-800"}`}>
+                {isAdmin ? "Admin" : isGuard ? "Guard" : "User"}
+              </span>
+            </div>
           </div>
 
           {/* Right: Nav links + Notifier + Auth */}
           <div className="flex items-center gap-4">
             <nav className="flex items-center gap-2">
-              <NavLink to="/dashboard" className={linkClass}>Dashboard</NavLink>
-              <NavLink to="/allocation" className={linkClass}>Allocation</NavLink>
-              <NavLink to="/attendance" className={linkClass}>Attendance</NavLink>
-              <NavLink to="/patrol" className={linkClass}>Patrols</NavLink>
-              <NavLink to="/patrol-tracker" className={linkClass}>Tracker</NavLink>
-              <NavLink to="/map" className={linkClass}>Map</NavLink>
-              <NavLink to="/analytics" className={linkClass}>Analytics</NavLink>
+              {/* Admin-only Dashboard */}
+              {isAdmin && <NavLink to="/dashboard" className={linkClass}>Dashboard</NavLink>}
 
-              {/* Guard View link only visible to guard users */}
-              {user?.is_guard === true && <NavLink to="/guard" className={linkClass}>Guard View</NavLink>}
+              {/* Admin-only management */}
+              {isAdmin && (
+                <>
+                  <NavLink to="/allocation" className={linkClass}>Allocation</NavLink>
+                  <NavLink to="/attendance" className={linkClass}>Attendance</NavLink>
+                  <NavLink to="/patrol" className={linkClass}>Patrols</NavLink>
+                  <NavLink to="/map" className={linkClass}>Map</NavLink>
+                  <NavLink to="/analytics" className={linkClass}>Analytics</NavLink>
+                </>
+              )}
 
-              {/* Scan QR (public) */}
-              <NavLink to="/scan" className={linkClass}>Scan QR</NavLink>
+              {/* Guard-only tools */}
+              {isGuard && (
+                <>
+                  <NavLink to="/guard" className={linkClass}>Guard View</NavLink>
+                  <NavLink to="/scan" className={linkClass}>Scan QR</NavLink>
+                  <NavLink to="/patrol-tracker" className={linkClass}>Patrol Tracker</NavLink>
+                </>
+              )}
+
+              {/* Fallback minimal link for other authenticated users */}
+              {!isAdmin && !isGuard && <NavLink to="/scan" className={linkClass}>Scan QR</NavLink>}
             </nav>
 
-            {/* Assignment notifier placed next to user controls */}
+            {/* Assignment notifier shown to admins & guards */}
             <div className="flex items-center">
-              <AssignmentNotifier />
+              {(isAdmin || isGuard) && <AssignmentNotifier />}
             </div>
 
             {/* Auth controls */}
-            {token ? (
-              <div className="flex items-center gap-3 ml-2">
-                <div className="text-sm text-slate-700 hidden sm:block">
-                  Hi{user?.username ? `, ${user.username}` : ""}
-                </div>
-                <button
-                  onClick={logout}
-                  className="px-3 py-2 rounded bg-rose-600 text-white text-sm hover:opacity-95"
-                  title="Logout"
-                >
-                  Logout
-                </button>
+            <div className="flex items-center gap-3 ml-2">
+              <div className="text-sm text-slate-700 hidden sm:block">
+                Hi{user?.username ? `, ${user.username}` : ""}
               </div>
-            ) : (
-              <Link to="/login" className="ml-2 px-3 py-2 rounded bg-emerald-600 text-white text-sm">Login</Link>
-            )}
+              <button
+                onClick={logout}
+                className="px-3 py-2 rounded-md bg-rose-600 text-white text-sm hover:bg-rose-500 transition"
+                title="Logout"
+              >
+                Logout
+              </button>
+            </div>
           </div>
         </div>
       </div>
@@ -115,14 +157,31 @@ function GuardProtectedRoute({ children }) {
   const { token, user, loading } = useContext(AuthContext);
 
   if (loading) return <LoadingScreen />;
-
-  // not logged in -> go to login
   if (!token) return <Navigate to="/login" replace />;
-
-  // logged in but not guard -> go to dashboard (or show unauthorized page if you prefer)
-  if (!user || user.is_guard !== true) return <Navigate to="/dashboard" replace />;
+  if (!user || user.is_guard !== true) return <Navigate to="/" replace />;
 
   return children;
+}
+
+/* AdminProtectedRoute: requires authenticated user AND user.is_admin === true */
+function AdminProtectedRoute({ children }) {
+  const { token, user, loading } = useContext(AuthContext);
+
+  if (loading) return <LoadingScreen />;
+  if (!token) return <Navigate to="/login" replace />;
+  if (!user || user.is_admin !== true) return <Navigate to="/" replace />;
+
+  return children;
+}
+
+/* Home redirect: land users to the correct primary page */
+function HomeRedirect() {
+  const { token, user, loading } = useContext(AuthContext);
+  if (loading) return <LoadingScreen />;
+  if (!token) return <Navigate to="/login" replace />;
+  if (user?.is_admin) return <Navigate to="/dashboard" replace />;
+  if (user?.is_guard) return <Navigate to="/guard" replace />;
+  return <Navigate to="/dashboard" replace />; // default for other authenticated users
 }
 
 /* Final App with BrowserRouter */
@@ -137,67 +196,55 @@ export default function App() {
             {/* Public */}
             <Route path="/login" element={<Login />} />
 
-            {/* Protected pages */}
+            {/* Admin-only Dashboard */}
             <Route
               path="/dashboard"
               element={
-                <ProtectedRoute>
+                <AdminProtectedRoute>
                   <Dashboard />
-                </ProtectedRoute>
+                </AdminProtectedRoute>
               }
             />
 
+            {/* Admin-only pages */}
             <Route
               path="/allocation"
               element={
-                <ProtectedRoute>
+                <AdminProtectedRoute>
                   <Allocation />
-                </ProtectedRoute>
+                </AdminProtectedRoute>
               }
             />
-
             <Route
               path="/attendance"
               element={
-                <ProtectedRoute>
+                <AdminProtectedRoute>
                   <Attendance />
-                </ProtectedRoute>
+                </AdminProtectedRoute>
               }
             />
-
             <Route
               path="/patrol"
               element={
-                <ProtectedRoute>
+                <AdminProtectedRoute>
                   <Patrol />
-                </ProtectedRoute>
+                </AdminProtectedRoute>
               }
             />
-
-            <Route
-              path="/patrol-tracker"
-              element={
-                <ProtectedRoute>
-                  <PatrolTracker />
-                </ProtectedRoute>
-              }
-            />
-
             <Route
               path="/map"
               element={
-                <ProtectedRoute>
+                <AdminProtectedRoute>
                   <PatrolMap />
-                </ProtectedRoute>
+                </AdminProtectedRoute>
               }
             />
-
             <Route
               path="/analytics"
               element={
-                <ProtectedRoute>
+                <AdminProtectedRoute>
                   <DashboardAnalytics />
-                </ProtectedRoute>
+                </AdminProtectedRoute>
               }
             />
 
@@ -211,11 +258,28 @@ export default function App() {
               }
             />
 
-            {/* Scan QR - kept public (change to ProtectedRoute if you want) */}
-            <Route path="/scan" element={<ScanQR />} />
+            {/* Guard-only Patrol Tracker */}
+            <Route
+              path="/patrol-tracker"
+              element={
+                <GuardProtectedRoute>
+                  <PatrolTracker />
+                </GuardProtectedRoute>
+              }
+            />
 
-            {/* Root -> Dashboard */}
-            <Route path="/" element={<Navigate to="/dashboard" replace />} />
+            {/* Scan QR - guard-only */}
+            <Route
+              path="/scan"
+              element={
+                <GuardProtectedRoute>
+                  <ScanQR />
+                </GuardProtectedRoute>
+              }
+            />
+
+            {/* Root -> role-aware redirect */}
+            <Route path="/" element={<HomeRedirect />} />
 
             {/* fallback */}
             <Route path="*" element={<Navigate to="/" replace />} />

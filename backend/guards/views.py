@@ -160,7 +160,20 @@ class ShiftViewSet(viewsets.ModelViewSet):
         return Response(ser.data)
 
 
-# ---------- Attendance ----------
+# backend/guards/views.py  <- replace existing AttendanceView class with this
+
+import json
+from datetime import datetime as _dt, time as _time, timedelta
+from django.utils import timezone
+from django.shortcuts import get_object_or_404
+from rest_framework.views import APIView
+from rest_framework.exceptions import ValidationError
+from rest_framework.response import Response
+from rest_framework import status
+
+from .models import Shift, AttendanceRecord
+from .serializers import AttendanceCreateSerializer, AttendanceSerializer
+
 class AttendanceView(APIView):
     permission_classes = [IsAuthenticated]
 
@@ -179,12 +192,24 @@ class AttendanceView(APIView):
                     raise ValidationError({"qr_payload": "Invalid JSON for qr_payload."})
         raise ValidationError({"qr_payload": "Invalid qr_payload type."})
 
-    def _make_aware(self, dt):
-        if timezone.is_naive(dt):
-            return timezone.make_aware(dt, timezone.get_current_timezone())
-        return dt
+    def _day_start_end_for_date(self, d):
+        """
+        Return aware datetimes for local-day start/end for date `d` (a date object).
+        This avoids missing rows due to timezone/UTC storage differences.
+        """
+        tz = timezone.get_current_timezone()
+        start_naive = _dt.combine(d, _time.min)
+        end_naive = _dt.combine(d, _time.max)
+        start = timezone.make_aware(start_naive, tz) if timezone.is_naive(start_naive) else start_naive
+        end = timezone.make_aware(end_naive, tz) if timezone.is_naive(end_naive) else end_naive
+        return start, end
 
     def get(self, request):
+        """
+        GET /api/attendance/?date=YYYY-MM-DD|today
+        Returns list of attendance records for given date (default: today).
+        Uses an aware start/end range to account for timezone differences.
+        """
         date_q = request.query_params.get("date", "today")
         if date_q == "today":
             d = timezone.localdate()
@@ -194,23 +219,87 @@ class AttendanceView(APIView):
                 return Response({"detail": "invalid date format, use YYYY-MM-DD or 'today'."}, status=status.HTTP_400_BAD_REQUEST)
             d = parsed
 
-        qs = AttendanceRecord.objects.filter(check_in_time__date=d).select_related("guard", "shift").order_by("-check_in_time")
+        start_dt, end_dt = self._day_start_end_for_date(d)
+
+        qs = AttendanceRecord.objects.filter(check_in_time__gte=start_dt, check_in_time__lte=end_dt).select_related("guard", "shift").order_by("-check_in_time")
         ser = AttendanceSerializer(qs, many=True, context={"request": request})
         return Response(ser.data)
 
     def post(self, request):
+        """
+        POST /api/attendance/
+        Body: { "shift_id": <int>, "qr_payload": <object|stringified-json>, "check_in_lat": <float>, "check_in_lng": <float>, "force": <bool>, "client_timestamp": <ISO datetime>, "client_tz_offset_minutes": <int> }
+        Delegates validation and time-window logic to AttendanceCreateSerializer.
+        """
         data = request.data.copy()
+
+        # parse qr payload (accept object or string)
         try:
-            data["qr_payload"] = self._parse_qr_payload(data.get("qr_payload"))
+            if "qr_payload" in data:
+                data["qr_payload"] = self._parse_qr_payload(data.get("qr_payload"))
         except ValidationError as e:
             return Response(e.detail, status=status.HTTP_400_BAD_REQUEST)
         except Exception:
             return Response({"detail": "Invalid qr_payload"}, status=status.HTTP_400_BAD_REQUEST)
 
+        # validate via serializer (it will resolve shift if shift_id present, and compute client timestamp used)
         serializer = AttendanceCreateSerializer(data=data, context={"request": request})
-        serializer.is_valid(raise_exception=True)
+        try:
+            serializer.is_valid(raise_exception=True)
+        except ValidationError as e:
+            return Response(e.detail, status=status.HTTP_400_BAD_REQUEST)
 
-        attendance = serializer.create(serializer.validated_data)
+        # resolved shift
+        shift = serializer.validated_data.get("_resolved_shift") or serializer.validated_data.get("shift")
+        if shift is None:
+            shift_id = serializer.validated_data.get("shift_id") or data.get("shift_id")
+            if not shift_id:
+                return Response({"shift_id": "This field is required."}, status=status.HTTP_400_BAD_REQUEST)
+            shift = get_object_or_404(Shift, pk=int(shift_id))
+
+        # Ensure QR payload matches the premise (defense in depth)
+        qr_payload = serializer.validated_data.get("qr_payload") or data.get("qr_payload") or {}
+        premise = shift.premise
+        qr_uuid = qr_payload.get("uuid")
+        qr_id = qr_payload.get("id")
+        if qr_uuid is not None:
+            if str(premise.uuid) != str(qr_uuid):
+                return Response({"qr_payload": "QR uuid does not match premise for this shift."}, status=status.HTTP_400_BAD_REQUEST)
+        elif qr_id is not None:
+            try:
+                if int(qr_id) != int(premise.id):
+                    return Response({"qr_payload": "QR id does not match premise for this shift."}, status=status.HTTP_400_BAD_REQUEST)
+            except Exception:
+                return Response({"qr_payload": "Invalid id in qr_payload."}, status=status.HTTP_400_BAD_REQUEST)
+        else:
+            return Response({"qr_payload": "Missing 'uuid' or 'id' in qr_payload."}, status=status.HTTP_400_BAD_REQUEST)
+
+        # call serializer.create (serializer will use context["request"] if needed)
+        try:
+            attendance = serializer.save()
+        except Exception as e:
+            # fallback to manual create if serializer.save isn't implemented that way
+            try:
+                attendance = serializer.create(serializer.validated_data)
+            except Exception as e2:
+                return Response({"detail": "Failed to create attendance", "error": str(e2)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+        # compute status relative to shift end (handle overnight)
+        tz = timezone.get_current_timezone()
+        end_dt = _dt.combine(shift.date, shift.end_time)
+        if timezone.is_naive(end_dt):
+            end_dt = timezone.make_aware(end_dt, tz)
+        # overnight adjustment if needed
+        start_dt = _dt.combine(shift.date, shift.start_time)
+        if timezone.is_naive(start_dt):
+            start_dt = timezone.make_aware(start_dt, tz)
+        if end_dt <= start_dt:
+            end_dt = end_dt + timedelta(days=1)
+
+        now_after_save = timezone.now()
+        attendance.status = "ON_TIME" if now_after_save <= end_dt else "LATE"
+        attendance.save(update_fields=["status"])
+
         out = AttendanceSerializer(attendance, context={"request": request}).data
         return Response(out, status=status.HTTP_201_CREATED)
 

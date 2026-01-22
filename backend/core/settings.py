@@ -136,6 +136,9 @@ USE_TZ = True
 CORS_ALLOW_ALL_ORIGINS = os.environ.get("CORS_ALLOW_ALL_ORIGINS", "true").lower() in ("1", "true", "t")
 
 # DRF + Simple JWT
+# near existing REST_FRAMEWORK in backend/core/settings.py
+from datetime import timedelta
+
 REST_FRAMEWORK = {
     "DEFAULT_AUTHENTICATION_CLASSES": (
         "rest_framework_simplejwt.authentication.JWTAuthentication",
@@ -144,6 +147,25 @@ REST_FRAMEWORK = {
         "rest_framework.permissions.IsAuthenticatedOrReadOnly",
     ),
 }
+
+# Simple JWT: increase access lifetime and provide refresh token.
+# Adjust ACCESS_TOKEN_LIFETIME to taste (hours) — 8 hours is a reasonable default for mobile/web apps.
+SIMPLE_JWT = {
+    "ACCESS_TOKEN_LIFETIME": timedelta(hours=8),        # change to e.g. timedelta(days=1) if you want even longer
+    "REFRESH_TOKEN_LIFETIME": timedelta(days=14),
+    "ROTATE_REFRESH_TOKENS": True,
+    "BLACKLIST_AFTER_ROTATION": False,
+    "ALGORITHM": "HS256",
+    "AUTH_HEADER_TYPES": ("Bearer",),
+    "AUTH_TOKEN_CLASSES": ("rest_framework_simplejwt.tokens.AccessToken",),
+}
+
+# If some parts of your app still use session cookies (or for admin use), make session long-lived:
+SESSION_COOKIE_AGE = 60 * 60 * 24 * 14   # 14 days
+SESSION_SAVE_EVERY_REQUEST = True       # optionally extend session expiry on activity
+
+
+
 
 # Default primary key
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"

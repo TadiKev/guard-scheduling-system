@@ -135,38 +135,51 @@ class ShiftSerializer(serializers.ModelSerializer):
 
 
 
-# ----------------- Attendance -----------------
-# paste this as the AttendanceCreateSerializer class in backend/guards/serializers.py
-
-# ----------------- Attendance -----------------
-# paste this as the AttendanceCreateSerializer class in backend/guards/serializers.py
-
 class AttendanceCreateSerializer(serializers.Serializer):
-    shift_id = serializers.IntegerField(required=False)
-    qr_payload = serializers.JSONField()
+    shift_id = serializers.IntegerField(required=False, allow_null=True)
+    qr_payload = serializers.JSONField(required=False, allow_null=True)
     check_in_lat = serializers.FloatField(required=False, allow_null=True)
     check_in_lng = serializers.FloatField(required=False, allow_null=True)
     force = serializers.BooleanField(required=False, default=False)
+    manual = serializers.BooleanField(required=False, default=False)
+
+    def _make_aware(self, dt):
+        if timezone.is_naive(dt):
+            return timezone.make_aware(dt, timezone.get_current_timezone())
+        return dt
+
+    def _in_allowed_window(self, shift, now):
+        start = datetime.datetime.combine(shift.date, shift.start_time)
+        end = datetime.datetime.combine(shift.date, shift.end_time)
+        if timezone.is_naive(start):
+            start = timezone.make_aware(start, timezone.get_current_timezone())
+        if timezone.is_naive(end):
+            end = timezone.make_aware(end, timezone.get_current_timezone())
+        if end <= start:
+            end += datetime.timedelta(days=1)
+        early = int(getattr(settings, "ATTENDANCE_ALLOWED_EARLY_MINUTES", 15))
+        late = int(getattr(settings, "ATTENDANCE_ALLOWED_LATE_MINUTES", 60))
+        window_start = start - datetime.timedelta(minutes=early)
+        window_end = end + datetime.timedelta(minutes=late)
+        return window_start <= now <= window_end, window_start, window_end
 
     def validate(self, data):
-        # parse qr payload first (we expect dict)
+        # normalize
         qr = data.get("qr_payload")
-        if not isinstance(qr, dict):
-            raise serializers.ValidationError({"qr_payload": "Invalid QR payload"})
+        incoming_shift_id = data.get("shift_id")
+        manual_flag = bool(data.get("manual", False))
+        now = timezone.localtime(timezone.now())
 
-        # attempt to find a shift id from incoming data / qr payload
-        incoming_shift_id = data.get("shift_id") or qr.get("shift_id") or qr.get("shift")
+        # Helper: try load shift by id if provided (and not null)
         shift = None
-
-        # helper: try to load a Shift by id
-        if incoming_shift_id:
+        if incoming_shift_id is not None:
             try:
                 shift = Shift.objects.get(pk=int(incoming_shift_id))
             except (Shift.DoesNotExist, ValueError, TypeError):
                 raise serializers.ValidationError({"shift_id": "Shift not found"})
 
-        # If no shift yet, try to resolve from premise id / uuid in QR payload
-        if shift is None:
+        # If not by id, try to resolve from QR payload (if provided)
+        if shift is None and isinstance(qr, dict) and qr:
             payload_id = qr.get("id")
             payload_uuid = qr.get("uuid")
             premise = None
@@ -181,123 +194,92 @@ class AttendanceCreateSerializer(serializers.Serializer):
                     premise = Premise.objects.get(uuid=str(payload_uuid))
                 except Premise.DoesNotExist:
                     raise serializers.ValidationError({"qr_payload": "QR premise uuid not found"})
-            else:
-                raise serializers.ValidationError({
-                    "qr_payload": "Missing shift_id or premise id/uuid in qr_payload"
-                })
+            # look for candidate shifts around now (today +/- 1)
+            if premise:
+                dates_to_check = [
+                    now.date(),
+                    (now - datetime.timedelta(days=1)).date(),
+                    (now + datetime.timedelta(days=1)).date(),
+                ]
+                candidates = Shift.objects.filter(premise=premise, date__in=dates_to_check).order_by("date", "start_time")
+                chosen = None
+                for s in candidates:
+                    ok, _, _ = self._in_allowed_window(s, now)
+                    if ok:
+                        chosen = s
+                        break
+                if chosen is None:
+                    chosen = candidates.filter(date=now.date()).first() or (candidates.last() if candidates.exists() else None)
+                if chosen:
+                    shift = chosen
+                    data["shift_id"] = shift.id
 
-            # find candidate shifts for that premise around today
-            today = timezone.localdate()
-            dates_to_check = [
-                today,
-                today - datetime.timedelta(days=1),
-                today + datetime.timedelta(days=1),
-            ]
+        # If still no shift and manual flag set, try to find an assigned shift for the user in window
+        if shift is None and manual_flag:
+            request = self.context.get("request")
+            user = getattr(request, "user", None)
+            if user and getattr(user, "is_authenticated", False):
+                dates_to_check = [now.date(), (now - datetime.timedelta(days=1)).date(), (now + datetime.timedelta(days=1)).date()]
+                qs = Shift.objects.filter(assigned_guard=user, date__in=dates_to_check).order_by("date", "start_time")
+                chosen = None
+                for s in qs:
+                    ok, _, _ = self._in_allowed_window(s, now)
+                    if ok:
+                        chosen = s
+                        break
+                if chosen:
+                    shift = chosen
+                    data["shift_id"] = shift.id
 
-            candidates = (
-                Shift.objects
-                .filter(premise=premise, date__in=dates_to_check)
-                .order_by("date", "start_time")
-            )
+        # If still no shift, fail with helpful message
+        if shift is None:
+            raise serializers.ValidationError({
+                "shift_id": "Missing shift_id / could not resolve a shift (provide shift_id, qr_payload with premise, or manual:true for assigned shift)."
+            })
 
-            now = timezone.localtime(timezone.now())
-            chosen = None
-            early = int(getattr(settings, "ATTENDANCE_ALLOWED_EARLY_MINUTES", 15))
-            late = int(getattr(settings, "ATTENDANCE_ALLOWED_LATE_MINUTES", 60))
-
-            for s in candidates:
-                s_start = datetime.datetime.combine(s.date, s.start_time)
-                s_end = datetime.datetime.combine(s.date, s.end_time)
-
-                if timezone.is_naive(s_start):
-                    s_start = timezone.make_aware(s_start, timezone.get_current_timezone())
-                if timezone.is_naive(s_end):
-                    s_end = timezone.make_aware(s_end, timezone.get_current_timezone())
-
-                # overnight shift handling
-                if s_end <= s_start:
-                    s_end += datetime.timedelta(days=1)
-
-                window_start = s_start - datetime.timedelta(minutes=early)
-                window_end = s_end + datetime.timedelta(minutes=late)
-
-                if window_start <= now <= window_end:
-                    chosen = s
-                    break
-
-            if chosen is None:
-                today_shift = candidates.filter(date=today).first()
-                chosen = today_shift or (candidates.last() if candidates.exists() else None)
-
-            if not chosen:
-                raise serializers.ValidationError({
-                    "shift_id": "Could not resolve a shift for this premise"
-                })
-
-            shift = chosen
-            data["shift_id"] = shift.id
-
-        # validate QR matches premise
+        # Validate QR matches premise if both present
         premise = shift.premise
-        payload_id = qr.get("id")
-        payload_uuid = qr.get("uuid")
+        if qr and premise:
+            payload_id = qr.get("id")
+            payload_uuid = qr.get("uuid")
+            if payload_id is not None:
+                try:
+                    if int(payload_id) != premise.id:
+                        raise serializers.ValidationError({"qr_payload": "QR does not match premise"})
+                except (ValueError, TypeError):
+                    raise serializers.ValidationError({"qr_payload": "Invalid qr id"})
+            elif payload_uuid is not None:
+                if str(payload_uuid) != str(premise.uuid):
+                    raise serializers.ValidationError({"qr_payload": "QR uuid does not match premise"})
 
-        if payload_id is not None:
-            try:
-                if int(payload_id) != premise.id:
-                    raise serializers.ValidationError({"qr_payload": "QR does not match premise"})
-            except (ValueError, TypeError):
-                raise serializers.ValidationError({"qr_payload": "Invalid qr id"})
-        elif payload_uuid is not None:
-            if str(payload_uuid) != str(premise.uuid):
-                raise serializers.ValidationError({"qr_payload": "QR uuid does not match premise"})
-
-        # build window
-        start = datetime.datetime.combine(shift.date, shift.start_time)
-        end = datetime.datetime.combine(shift.date, shift.end_time)
-
-        if timezone.is_naive(start):
-            start = timezone.make_aware(start, timezone.get_current_timezone())
-        if timezone.is_naive(end):
-            end = timezone.make_aware(end, timezone.get_current_timezone())
-
-        if end <= start:
-            end += datetime.timedelta(days=1)
-
-        early = int(getattr(settings, "ATTENDANCE_ALLOWED_EARLY_MINUTES", 15))
-        late = int(getattr(settings, "ATTENDANCE_ALLOWED_LATE_MINUTES", 60))
-
-        window_start = start - datetime.timedelta(minutes=early)
-        window_end = end + datetime.timedelta(minutes=late)
-
-        # force logic
+        # time window enforcement (unless allowed force)
+        ok, window_start, window_end = self._in_allowed_window(shift, now)
         raw_force = data.get("force", False)
         force_flag = bool(raw_force) if isinstance(raw_force, (bool, int)) else (
             raw_force.lower() in ("1", "true", "yes") if isinstance(raw_force, str) else False
         )
-
         request = self.context.get("request")
         user = getattr(request, "user", None)
-
         allow_force_env = os.environ.get("ALLOW_FORCE_CHECKIN", "false").lower() in ("1", "true", "yes")
         allow_force_settings = bool(getattr(settings, "ATTENDANCE_ALLOW_FORCE_FOR_STAFF", False))
-
         user_can_force = bool(
             allow_force_env
             or allow_force_settings
             or (user and (user.is_staff or user.has_perm("guards.force_checkin")))
         )
+        if not ok and not (force_flag and user_can_force):
+            raise serializers.ValidationError({
+                "detail": f"Check-in outside allowed window {window_start.isoformat()} - {window_end.isoformat()}",
+                "shift_id": shift.id,
+                "shift_date": shift.date.isoformat(),
+                "shift_start": shift.start_time.isoformat(),
+                "shift_end": shift.end_time.isoformat(),
+            })
 
-        now = timezone.localtime(timezone.now())
-        if not (window_start <= now <= window_end):
-            if not (force_flag and user_can_force):
-                raise serializers.ValidationError({
-                    "detail": f"Check-in outside allowed window {window_start.isoformat()} - {window_end.isoformat()}",
-                    "shift_id": shift.id,
-                    "shift_date": shift.date.isoformat(),
-                    "shift_start": shift.start_time.isoformat(),
-                    "shift_end": shift.end_time.isoformat(),
-                })
+        # prevent duplicate check-in for same guard+shift
+        if request and getattr(request, "user", None):
+            if AttendanceRecord.objects.filter(shift=shift, guard=request.user).exists():
+                raise serializers.ValidationError({"detail": "You have already checked in for this shift."})
 
         data["_resolved_shift"] = shift
         return data
@@ -305,11 +287,9 @@ class AttendanceCreateSerializer(serializers.Serializer):
     def create(self, validated_data):
         request = self.context.get("request")
         user = getattr(request, "user", None)
-
         shift = validated_data.pop("_resolved_shift")
-
         attendance = AttendanceRecord.objects.create(
-            guard=user if user and user.is_authenticated else None,
+            guard=user if user and getattr(user, "is_authenticated", False) else None,
             shift=shift,
             check_in_time=timezone.now(),
             check_in_lat=validated_data.get("check_in_lat"),
@@ -317,23 +297,18 @@ class AttendanceCreateSerializer(serializers.Serializer):
             qr_payload=validated_data.get("qr_payload"),
             status="ON_TIME",
         )
-
         # finalize status
         start_dt = datetime.datetime.combine(shift.date, shift.start_time)
         end_dt = datetime.datetime.combine(shift.date, shift.end_time)
-
         if timezone.is_naive(start_dt):
             start_dt = timezone.make_aware(start_dt, timezone.get_current_timezone())
         if timezone.is_naive(end_dt):
             end_dt = timezone.make_aware(end_dt, timezone.get_current_timezone())
-
         if end_dt <= start_dt:
             end_dt += datetime.timedelta(days=1)
-
         now_local = timezone.localtime(timezone.now())
         attendance.status = "ON_TIME" if now_local <= end_dt else "LATE"
         attendance.save(update_fields=["status"])
-
         return attendance
 
     def update(self, instance, validated_data):
@@ -342,6 +317,7 @@ class AttendanceCreateSerializer(serializers.Serializer):
                 setattr(instance, attr, value)
         instance.save()
         return instance
+
 
 
 

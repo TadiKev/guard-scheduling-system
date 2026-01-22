@@ -1,4 +1,5 @@
-import React, { useEffect, useState } from "react";
+// frontend/src/pages/AttendancePage.jsx  (replace existing file with this)
+import React, { useEffect, useState, useRef } from "react";
 import api, { safeGet } from "../api";
 
 function Row({ a }) {
@@ -6,8 +7,8 @@ function Row({ a }) {
     <tr>
       <td className="px-3 py-2 border-b">{a.guard?.username ?? "—"}</td>
       <td className="px-3 py-2 border-b">{a.shift?.premise?.name ?? "—"}</td>
-      <td className="px-3 py-2 border-b">{new Date(a.check_in_time).toLocaleTimeString()}</td>
-      <td className="px-3 py-2 border-b">{a.status}</td>
+      <td className="px-3 py-2 border-b">{new Date(a.check_in_time).toLocaleString()}</td>
+      <td className="px-3 py-2 border-b">{a.status ?? "—"}</td>
     </tr>
   );
 }
@@ -18,22 +19,30 @@ export default function AttendancePage() {
   const [stats, setStats] = useState({present:0, late:0, absent:0});
   const [loading, setLoading] = useState(true);
   const [msg, setMsg] = useState(null);
+  const pollingRef = useRef(null);
 
   async function load() {
     setLoading(true);
+    setMsg(null);
     try {
       const res = await safeGet(`/attendance/?date=${date}`);
-      setRows(res.data || []);
+      const data = res.data || [];
+      setRows(data);
       // compute stats
       let present = 0, late = 0;
-      (res.data||[]).forEach(r => {
+      data.forEach(r => {
         if (r.status === "LATE") late++;
         else present++;
       });
-      // absent is unknown without shifts count; leave blank
-      setStats({present, late, absent: Math.max(0, (12 - (present+late)) )});
+      // absent is unknown server-side; show 0 or keep your business logic
+      setStats({present, late, absent: Math.max(0, 12 - (present+late))});
     } catch (err) {
       console.warn("attendance load failed", err);
+      if (err?.response?.status === 401) {
+        setMsg({ type: "error", text: "Unauthorized (401). Token expired? Please login again or refresh token." });
+      } else {
+        setMsg({ type: "error", text: err?.response?.data || err.message || "Failed to load attendance." });
+      }
       setRows([]);
       setStats({present:0,late:0,absent:0});
     } finally {
@@ -42,23 +51,73 @@ export default function AttendancePage() {
   }
 
   useEffect(() => {
+    // load on mount / date change
     load();
+
+    // start polling every 10s for near real-time updates
+    if (pollingRef.current) clearInterval(pollingRef.current);
+    pollingRef.current = setInterval(() => load(), 10000);
+
+    return () => {
+      if (pollingRef.current) clearInterval(pollingRef.current);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [date]);
 
   async function simulateQR() {
     setMsg(null);
+    // ask for shift id + premise uuid (quick test)
+    const shiftRaw = window.prompt("Enter shift_id to simulate (e.g. 2):");
+    if (!shiftRaw) return;
+    const shift_id = Number(shiftRaw);
+    if (!shift_id || isNaN(shift_id)) {
+      setMsg({ type: "error", text: "Invalid shift_id" });
+      return;
+    }
+    const uuid = window.prompt("Enter premise uuid (copy the premise uuid from admin or premises list):");
+    if (!uuid) {
+      setMsg({ type: "error", text: "Premise uuid required for simulation" });
+      return;
+    }
+
+    // optional geolocation
+    let coords = { lat: null, lng: null };
     try {
-      await api.post("/attendance/", {}); // backend needs qr_payload etc — this is a placeholder; adjust as needed
+      const pos = await new Promise((resolve, reject) => {
+        if (!navigator.geolocation) return reject(new Error("Geolocation not available"));
+        navigator.geolocation.getCurrentPosition(resolve, reject, { enableHighAccuracy: true, timeout: 8000 });
+      });
+      coords.lat = pos.coords.latitude;
+      coords.lng = pos.coords.longitude;
+    } catch (e) {
+      // ignore if unavailable
+      console.warn("geo failed", e);
+    }
+
+    const payload = {
+      shift_id,
+      qr_payload: { uuid }, // or { id: <premise-id> } depending on your QR contents
+      check_in_lat: coords.lat,
+      check_in_lng: coords.lng
+    };
+
+    try {
+      const res = await api.post("/attendance/", payload);
       setMsg({ type: "success", text: "Simulated check-in posted" });
-      load();
+      // refresh immediately
+      await load();
     } catch (err) {
-      setMsg({ type: "error", text: err?.response?.data || "Simulate failed" });
+      console.error("simulate failed", err);
+      if (err?.response) {
+        setMsg({ type: "error", text: JSON.stringify(err.response.data) });
+      } else {
+        setMsg({ type: "error", text: err.message || "Simulate failed" });
+      }
     }
   }
 
   return (
     <div className="min-h-screen bg-slate-50">
-   
       <main className="max-w-7xl mx-auto p-6">
         <div className="flex items-center justify-between">
           <div>
@@ -68,6 +127,7 @@ export default function AttendancePage() {
           <div className="flex items-center gap-3">
             <input type="date" value={date} onChange={e => setDate(e.target.value)} className="px-3 py-2 border rounded" />
             <button onClick={simulateQR} className="px-3 py-2 bg-emerald-600 text-white rounded">Simulate QR</button>
+            <button onClick={load} className="px-3 py-2 border rounded">Refresh</button>
           </div>
         </div>
 
