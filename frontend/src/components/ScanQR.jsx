@@ -5,13 +5,12 @@ import api from "../api";
 import AuthContext from "../AuthContext";
 
 /*
-  Changes / fixes:
-  - Maintain running/paused flags (runningRef, pausedRef) to avoid calling stop/pause/resume
-    when scanner isn't in the expected state (prevents "Cannot stop, scanner is not running or paused." errors).
-  - Wrap all scanner ops in try/catch and ignore known harmless library errors.
-  - Expose a "Force check-in" retry if backend returns the "outside allowed window" message.
-  - Prevent double starts by checking instRef.current.
-  - Do not throw from lifecycle handlers (prevents React error boundary triggers).
+  Improvements:
+  - Avoid sending shift_id: null
+  - Helper makeCheckinBody to normalize payload/shift_id
+  - Console.debug outgoing body for easy Network inspection
+  - Set rawText on scan so force/manual have something to reuse
+  - Defensive safePause/safeResume and lifecycle cleanup
 */
 
 export default function ScanQR() {
@@ -158,6 +157,18 @@ export default function ScanQR() {
     return false;
   }, []);
 
+  // helper to build request body and avoid sending shift_id:null
+  function makeCheckinBody(payload) {
+    const b = { qr_payload: payload || {} };
+    // try multiple common keys
+    const sidRaw = payload?.shift_id ?? payload?.shift ?? payload?.shiftId ?? payload?.id ?? null;
+    if (sidRaw !== null && sidRaw !== undefined && String(sidRaw).trim() !== "") {
+      const sidNum = Number(sidRaw);
+      b.shift_id = Number.isFinite(sidNum) ? sidNum : sidRaw;
+    }
+    return b;
+  }
+
   async function onScanSuccess(decodedText, decodedResult) {
     // immediately avoid double-processing
     try {
@@ -169,6 +180,9 @@ export default function ScanQR() {
     setShowForceOption(false);
     setMessage({ type: "info", text: `Scanned: ${String(decodedText).slice(0, 200)}` });
 
+    // set rawText so force/manual can reuse the last scanned payload
+    setRawText(String(decodedText));
+
     // parse payload
     let payload = null;
     try {
@@ -179,10 +193,7 @@ export default function ScanQR() {
       else payload = { raw: decodedText };
     }
 
-    const bodyBase = {
-      shift_id: payload.shift_id || payload.shift || null,
-      qr_payload: payload,
-    };
+    const bodyBase = makeCheckinBody(payload);
 
     // add geolocation if available
     try {
@@ -196,6 +207,9 @@ export default function ScanQR() {
     } catch (e) {
       // ignore geolocation errors
     }
+
+    // debug outgoing body (inspect in Network devtools too)
+    console.debug("Checkin body:", bodyBase);
 
     // perform check-in
     try {
@@ -235,8 +249,7 @@ export default function ScanQR() {
 
   // allow user to attempt force check-in (useful during testing or when backend supports it)
   async function handleForceCheckin() {
-    // attempt to parse whatever last message payload was (best-effort).
-    // For clarity: this re-uses rawText if present, otherwise we ask user to paste payload.
+    // try parsing rawText
     let payload = null;
     if (rawText) {
       try { payload = JSON.parse(rawText); } catch (e) {
@@ -251,11 +264,10 @@ export default function ScanQR() {
       return;
     }
 
-    const body = {
-      shift_id: payload.shift_id || payload.shift || null,
-      qr_payload: payload,
-      force: true
-    };
+    const body = makeCheckinBody(payload);
+    body.force = true;
+
+    console.debug("Force checkin body:", body);
 
     try {
       const res = await api.post("/attendance/checkin/", body);
@@ -287,7 +299,8 @@ export default function ScanQR() {
       else payload = { raw: rawText };
     }
 
-    const body = { shift_id: payload.shift_id || payload.shift || null, qr_payload: payload };
+    const body = makeCheckinBody(payload);
+    console.debug("Manual checkin body:", body);
 
     try {
       const res = await api.post("/attendance/checkin/", body);
@@ -322,8 +335,8 @@ export default function ScanQR() {
         <div className="mb-3">
           <div className="text-sm text-slate-600 mb-2">The backend rejected the check-in due to attendance window. You can retry with force (only use if permitted).</div>
           <div className="flex gap-2">
-            <button onClick={handleForceCheckin} className="px-3 py-2 bg-amber-600 text-white rounded">Retry with force</button>
-            <button onClick={() => setShowForceOption(false)} className="px-3 py-2 bg-slate-100 rounded">Dismiss</button>
+            <button type="button" onClick={handleForceCheckin} className="px-3 py-2 bg-amber-600 text-white rounded">Retry with force</button>
+            <button type="button" onClick={() => setShowForceOption(false)} className="px-3 py-2 bg-slate-100 rounded">Dismiss</button>
           </div>
         </div>
       )}

@@ -445,6 +445,7 @@ from django.shortcuts import get_object_or_404
 from django.db import transaction
 from django.utils import timezone
 from django.utils.dateparse import parse_date
+from datetime import timedelta, datetime
 from asgiref.sync import async_to_sync
 from channels.layers import get_channel_layer
 
@@ -457,34 +458,121 @@ User = get_user_model()
 class AllocateView(APIView):
     """
     POST /api/allocate/
-    body: { "premise_id": <int>, "date": "YYYY-MM-DD" | "today" (optional), "limit_per_shift": <int - optional> }
-    Assigns best matching guards to unassigned shifts and notifies each assigned guard's websocket group:
-       user_{guard_id}
+
+    Body examples:
+      { "premise_id": 3, "date": "2026-01-26", "limit_per_shift": 1 }
+      { "premise_uuid": "978bb97a-...", "date": "today" }
+      { "start_date": "2026-01-26", "end_date": "2026-01-27", "limit_per_shift": 2 }
+      { "limit_per_shift": 1 }  # operate across all premises for today
+
+    Behaviour:
+     - If premise_id / premise_uuid / premise_name provided, allocation targets that premise.
+     - If date OR start_date+end_date provided, allocation runs for that day/range.
+     - If nothing provided, it operates across all premises for today.
+     - Avoids assigning guards with overlapping shifts (same date/time).
+     - Uses simple scoring: skill matches * 10 + experience_years.
+     - Uses DB transaction + select_for_update to avoid race conditions.
+     - Notifies guard websocket group "user_{id}" on assignment (best-effort, non-blocking).
     """
     permission_classes = [IsAuthenticated]
+
+    def _parse_premise_selector(self, data):
+        premise = None
+        premise_id_raw = data.get("premise_id") or data.get("premise")
+        premise_uuid = data.get("premise_uuid") or data.get("uuid")
+        premise_name = data.get("premise_name") or data.get("name")
+
+        if premise_id_raw is not None and str(premise_id_raw).strip() != "":
+            try:
+                pid = int(premise_id_raw)
+            except (ValueError, TypeError):
+                raise ValueError("premise_id must be an integer")
+            premise = Premise.objects.filter(pk=pid).first()
+            if premise is None:
+                raise LookupError("premise not found")
+            return premise
+
+        if premise_uuid:
+            premise = Premise.objects.filter(uuid=str(premise_uuid)).first()
+            if premise is None:
+                raise LookupError("premise with that uuid not found")
+            return premise
+
+        if premise_name:
+            premise = Premise.objects.filter(name__iexact=str(premise_name)).first()
+            if premise is None:
+                raise LookupError("premise with that name not found")
+            return premise
+
+        return None  # operate across all premises
+
+    def _build_dates_list(self, data):
+        date_q = data.get("date")
+        start_date_q = data.get("start_date")
+        end_date_q = data.get("end_date")
+
+        if date_q not in (None, "", "today") and start_date_q is None and end_date_q is None:
+            parsed = parse_date(str(date_q))
+            if not parsed:
+                raise ValueError("Invalid date format, use YYYY-MM-DD or 'today'.")
+            return [parsed]
+
+        if (start_date_q or end_date_q) and not (start_date_q and end_date_q):
+            raise ValueError("Provide both start_date and end_date (YYYY-MM-DD) or a single date.")
+
+        if start_date_q and end_date_q:
+            start_parsed = parse_date(str(start_date_q))
+            end_parsed = parse_date(str(end_date_q))
+            if not start_parsed or not end_parsed:
+                raise ValueError("Invalid date format for start_date/end_date, use YYYY-MM-DD.")
+            if end_parsed < start_parsed:
+                raise ValueError("end_date must be the same or after start_date.")
+            delta_days = (end_parsed - start_parsed).days
+            if delta_days > 31:
+                raise ValueError("Range too large (max 31 days).")
+            return [start_parsed + timedelta(days=i) for i in range(delta_days + 1)]
+
+        # default: today
+        return [timezone.localdate()]
+
+    def _score_guard_for_skills(self, guard_prof, required_skills):
+        req_set = {s.strip().lower() for s in (required_skills or "").split(",") if s.strip()}
+        guard_set = {s.strip().lower() for s in (guard_prof.skills or "").split(",") if s.strip()}
+        skill_matches = len(req_set & guard_set)
+        return skill_matches * 10 + (guard_prof.experience_years or 0)
+
+    def _guard_has_conflict(self, guard_user, shift_to_assign):
+        """
+        True if guard_user has an overlapping assigned shift on the same date.
+        Overlap test uses time comparisons for shifts on the same date.
+        """
+        if not guard_user:
+            return True
+        conflicts = Shift.objects.filter(assigned_guard=guard_user, date=shift_to_assign.date).exclude(pk=shift_to_assign.pk)
+        for s in conflicts:
+            # times are naive time objects; check overlap on same day
+            if not (s.end_time <= shift_to_assign.start_time or s.start_time >= shift_to_assign.end_time):
+                return True
+        return False
 
     def post(self, request):
         data = request.data or {}
 
-        # premise_id validation
-        premise_id = data.get("premise_id")
-        if premise_id is None:
-            return Response({"premise_id": "This field is required."}, status=status.HTTP_400_BAD_REQUEST)
+        # parse premise selector (safe)
         try:
-            premise_id = int(premise_id)
-        except (ValueError, TypeError):
-            return Response({"premise_id": "premise_id must be an integer."}, status=status.HTTP_400_BAD_REQUEST)
+            premise = self._parse_premise_selector(data)
+        except ValueError as ve:
+            return Response({"premise_id": str(ve)}, status=status.HTTP_400_BAD_REQUEST)
+        except LookupError as le:
+            return Response({"premise": str(le)}, status=status.HTTP_400_BAD_REQUEST)
 
-        # date handling: accept "today" or ISO YYYY-MM-DD; if absent use today
-        date_q = data.get("date")
-        if date_q in [None, "", "today"]:
-            d = timezone.localdate()
-        else:
-            d = parse_date(str(date_q))
-            if not d:
-                return Response({"date": "Invalid date format, use YYYY-MM-DD or 'today'."}, status=status.HTTP_400_BAD_REQUEST)
+        # build dates list
+        try:
+            dates = self._build_dates_list(data)
+        except ValueError as ve:
+            return Response({"date_range": str(ve)}, status=status.HTTP_400_BAD_REQUEST)
 
-        # limit per shift
+        # limit per shift (guards per shift)
         try:
             limit_per_shift = int(data.get("limit_per_shift", 1))
             if limit_per_shift < 1:
@@ -492,95 +580,90 @@ class AllocateView(APIView):
         except (ValueError, TypeError):
             limit_per_shift = 1
 
-        premise = get_object_or_404(Premise, pk=premise_id)
+        # get premises to process
+        premises_to_process = [premise] if premise is not None else list(Premise.objects.all())
+        if not premises_to_process:
+            return Response({"detail": "No premises found to allocate."}, status=status.HTTP_400_BAD_REQUEST)
 
-        # find unassigned shifts for that premise on date
-        shifts_qs = Shift.objects.filter(premise=premise, date=d, assigned_guard__isnull=True).order_by("start_time")
-        if not shifts_qs.exists():
-            return Response({"assignments": [], "count": 0, "detail": "No unassigned shifts found for that premise and date."})
-
+        # load guard profiles and lightweight precomputation
         guard_profiles = list(GuardProfile.objects.select_related("user").all())
-
-        def score_guard_for_skills(guard_prof, required_skills):
-            req_set = {s.strip().lower() for s in (required_skills or "").split(",") if s.strip()}
-            guard_set = {s.strip().lower() for s in (guard_prof.skills or "").split(",") if s.strip()}
-            skill_matches = len(req_set & guard_set)
-            return skill_matches * 10 + (guard_prof.experience_years or 0)
-
-        def guard_has_conflict(guard_user, shift_to_assign):
-            if not guard_user:
-                return True
-            conflicts = Shift.objects.filter(assigned_guard=guard_user, date=shift_to_assign.date).exclude(pk=shift_to_assign.pk)
-            for s in conflicts:
-                # overlapping check
-                if not (s.end_time <= shift_to_assign.start_time or s.start_time >= shift_to_assign.end_time):
-                    return True
-            return False
 
         assignments = []
         assigned_guard_ids = set()
-
         channel_layer = get_channel_layer()
-        # helper to send to per-user group: user_<id>
+
         def notify_user(guard_id, payload):
             try:
                 async_to_sync(channel_layer.group_send)(f"user_{guard_id}", {
-                    "type": "assignment.created",  # will call assignment_created handler on consumer
+                    "type": "assignment.created",
                     "assignment": payload,
                 })
             except Exception:
-                # don't break assignment if notification fails; log in real app
+                # don't fail allocation on notify errors
                 pass
 
-        # Wrap in transaction to avoid partial assignments in race conditions
+        # transactional allocation
         with transaction.atomic():
-            for shift in shifts_qs:
-                req_skills = shift.required_skills or ""
-                candidates = []
-                for gp in guard_profiles:
-                    if gp.user_id in assigned_guard_ids:
+            for premise_obj in premises_to_process:
+                for d in dates:
+                    # find unassigned shifts for that premise and date
+                    shifts_qs = Shift.objects.filter(premise=premise_obj, date=d, assigned_guard__isnull=True).order_by("start_time")
+                    if not shifts_qs.exists():
                         continue
-                    if getattr(gp.user, "is_staff", False):
-                        continue
-                    if guard_has_conflict(gp.user, shift):
-                        continue
-                    candidates.append((score_guard_for_skills(gp, req_skills), gp))
 
-                candidates.sort(key=lambda x: x[0], reverse=True)
+                    for shift in shifts_qs:
+                        candidates = []
+                        for gp in guard_profiles:
+                            # skip already assigned in this run
+                            if gp.user_id in assigned_guard_ids:
+                                continue
+                            # skip staff-like users
+                            if getattr(gp.user, "is_staff", False):
+                                continue
+                            # skip non-guards
+                            if not getattr(gp.user, "is_guard", False):
+                                continue
+                            # skip conflicts
+                            if self._guard_has_conflict(gp.user, shift):
+                                continue
 
-                if not candidates:
-                    continue
+                            score = self._score_guard_for_skills(gp, shift.required_skills or "")
+                            candidates.append((score, gp))
 
-                assigned_for_this_shift = 0
-                for score_val, gp in candidates:
-                    if assigned_for_this_shift >= limit_per_shift:
-                        break
-                    # double-check still unassigned via select_for_update
-                    fresh = Shift.objects.select_for_update().get(pk=shift.pk)
-                    if fresh.assigned_guard is not None:
-                        break
-                    fresh.assigned_guard = gp.user
-                    fresh.assigned_at = timezone.now()
-                    fresh.save(update_fields=["assigned_guard", "assigned_at"])
-                    assigned_guard_ids.add(gp.user_id)
+                        candidates.sort(key=lambda x: x[0], reverse=True)
+                        if not candidates:
+                            continue
 
-                    assignment_payload = {
-                        "shift_id": fresh.id,
-                        "assigned_guard_id": gp.user.id,
-                        "guard_username": gp.user.username,
-                        "score": score_val,
-                        "assigned_at": fresh.assigned_at.isoformat(),
-                        "premise_id": premise.id,
-                        "premise_name": premise.name,
-                    }
-                    assignments.append(assignment_payload)
-                    assigned_for_this_shift += 1
+                        assigned_for_this_shift = 0
+                        for score_val, gp in candidates:
+                            if assigned_for_this_shift >= limit_per_shift:
+                                break
+                            # lock the shift record and double-check
+                            fresh = Shift.objects.select_for_update().get(pk=shift.pk)
+                            if fresh.assigned_guard is not None:
+                                break
+                            fresh.assigned_guard = gp.user
+                            fresh.assigned_at = timezone.now()
+                            fresh.save(update_fields=["assigned_guard", "assigned_at"])
+                            assigned_guard_ids.add(gp.user_id)
 
-                    # Notify the specific guard's websocket group (user_{id})
-                    notify_user(gp.user.id, assignment_payload)
+                            payload = {
+                                "shift_id": fresh.id,
+                                "assigned_guard_id": gp.user.id,
+                                "guard_username": gp.user.username,
+                                "score": score_val,
+                                "assigned_at": fresh.assigned_at.isoformat(),
+                                "premise_id": premise_obj.id,
+                                "premise_name": premise_obj.name,
+                            }
+                            assignments.append(payload)
+                            assigned_for_this_shift += 1
 
-        return Response({"assignments": assignments, "count": len(assignments)})
-        
+                            # notify (best-effort)
+                            notify_user(gp.user.id, payload)
+
+        return Response({"assignments": assignments, "count": len(assignments)}, status=status.HTTP_200_OK)
+
 
 class RecentAssignmentsView(APIView):
     """
@@ -595,6 +678,7 @@ class RecentAssignmentsView(APIView):
             limit = int(request.query_params.get("limit", 50))
         except (ValueError, TypeError):
             limit = 50
+
         qs = Shift.objects.filter(assigned_guard__isnull=False).order_by('-assigned_at')
         if since_q:
             try:
@@ -603,7 +687,9 @@ class RecentAssignmentsView(APIView):
                 if since_dt:
                     qs = qs.filter(assigned_at__gte=since_dt)
             except Exception:
+                # ignore parse error and return default list
                 pass
+
         qs = qs[:min(limit, 200)]
         out = []
         for s in qs:
@@ -614,7 +700,8 @@ class RecentAssignmentsView(APIView):
                 "guard_username": s.assigned_guard.username if s.assigned_guard else None,
                 "assigned_at": s.assigned_at.isoformat() if s.assigned_at else None,
             })
-        return Response({"assignments": out})
+        return Response({"assignments": out}, status=status.HTTP_200_OK)
+
 
 
 
@@ -814,52 +901,91 @@ class GuardAttendanceHistoryView(APIView):
         serializer = AttendanceSerializer(qs, many=True, context={"request": request})
         return Response(serializer.data, status=status.HTTP_200_OK)
 
+# backend/guards/views.py
+import json
+from io import BytesIO
+from datetime import datetime, timedelta
+
+from django.utils import timezone
+from django.http import HttpResponse
+from django.conf import settings
+from django.shortcuts import get_object_or_404
+
+from rest_framework.views import APIView
+from rest_framework.response import Response
+from rest_framework.exceptions import ValidationError
+from rest_framework.permissions import IsAuthenticated, AllowAny
+from rest_framework import status
+
+from django.contrib.auth import get_user_model
+
+from .models import Premise, Shift, AttendanceRecord, GuardProfile, PatrolCoordinate
+from .serializers import AttendanceCreateSerializer, AttendanceSerializer
+
+User = get_user_model()
+
 class QRCheckInView(APIView):
     """
     POST /api/attendance/checkin/
-    Body:
-      {
-        "shift_id": <int>,
-        "qr_payload": { ... },          # expected JSON payload embedded in QR
-        "check_in_lat": <float>,        # optional
-        "check_in_lng": <float>,        # optional
-        "force": <bool>                 # optional, staff override
-      }
+    Accepts:
+      - shift_id (optional)
+      - qr_payload (object or JSON string) containing premise uuid/id
+      - check_in_lat, check_in_lng (optional)
+      - force (optional bool) for staff override
 
-    Authentication:
-      - Recommended: require authentication (IsAuthenticated) so the backend attributes the
-        attendance to `request.user`. If you want public QR scans you could change to AllowAny
-        and require a signed QR payload — but here we use IsAuthenticated for security.
+    The serializer will resolve the shift if shift_id is missing by matching the qr_payload to a Premise
+    and selecting a sensible Shift (prefer a shift whose allowed window contains the provided timestamp or now).
     """
     permission_classes = [IsAuthenticated]
 
     def post(self, request):
-        data = request.data or {}
-        # set serializer context so validation can access request
+        data = request.data.copy()
+
+        # Ensure qr_payload is parsed into an object (serializer also parses but we pre-parse to give better errors)
+        raw = data.get("qr_payload")
+        if raw is not None:
+            if isinstance(raw, str):
+                try:
+                    data["qr_payload"] = json.loads(raw)
+                except Exception:
+                    try:
+                        data["qr_payload"] = json.loads(raw.replace("'", '"'))
+                    except Exception:
+                        return Response({"qr_payload": "Invalid JSON"}, status=status.HTTP_400_BAD_REQUEST)
+
         ser = AttendanceCreateSerializer(data=data, context={"request": request})
-        if not ser.is_valid():
-            return Response(ser.errors, status=status.HTTP_400_BAD_REQUEST)
-
-        attendance = ser.create(ser.validated_data)
-        out = AttendanceSerializer(attendance).data
-
-        # notify user via channels: send to per-user group and optionally to dispatchers
         try:
-            channel_layer = get_channel_layer()
-            payload = {
-                "type": "attendance.created",
-                "attendance": out,
-            }
-            # notify the guard (user_{id})
-            if attendance.guard_id:
-                async_to_sync(channel_layer.group_send)(f"user_{attendance.guard_id}", {"type": "attendance.created", "attendance": out})
-            # optionally notify a dispatchers group (if you use it)
-            async_to_sync(channel_layer.group_send)("dispatchers", {"type": "attendance.created", "attendance": out})
+            ser.is_valid(raise_exception=True)
+        except ValidationError as e:
+            # pass serializer errors through
+            return Response(e.detail, status=status.HTTP_400_BAD_REQUEST)
+
+        # create attendance record (serializer.create will use request user as guard)
+        try:
+            attendance = ser.create(ser.validated_data)
+        except Exception as e:
+            return Response({"detail": "Failed to create attendance", "error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+        # After save set final ON_TIME or LATE relative to shift end (handles overnight)
+        try:
+            shift = attendance.shift
+            tz = timezone.get_current_timezone()
+            end_dt = datetime.combine(shift.date, shift.end_time)
+            if timezone.is_naive(end_dt):
+                end_dt = timezone.make_aware(end_dt, tz)
+            # overnight adjust
+            if end_dt <= datetime.combine(shift.date, shift.start_time):
+                end_dt = end_dt + timedelta(days=1)
+            now_after_save = timezone.now()
+            attendance.status = "ON_TIME" if now_after_save <= end_dt else "LATE"
+            attendance.save(update_fields=["status"])
         except Exception:
-            # don't fail the request if notifications fail
+            # if anything fails here we still return the record
             pass
 
+        out = AttendanceSerializer(attendance, context={"request": request}).data
         return Response(out, status=status.HTTP_201_CREATED)
+
 
 
 class RecentGuardAttendanceView(APIView):
