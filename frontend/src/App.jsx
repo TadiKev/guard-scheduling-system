@@ -162,7 +162,7 @@ function NavBar() {
   return (
     <header className="sticky top-0 z-40">
       <div className="relative">
-        {/* subtle animated background glow */}
+        {/* subtle animated background glow */} 
         <div className="absolute -top-6 left-1/2 -translate-x-1/2 w-[1200px] h-36 rounded-full bg-gradient-to-r from-emerald-300 via-cyan-200 to-indigo-300 opacity-10 blur-3xl pointer-events-none" />
 
         <div className="bg-white/75 backdrop-blur-md border-b border-slate-100 shadow-lg">
@@ -251,6 +251,11 @@ function NavBar() {
                       <NavLink to="/scan" className={linkClass}>
                         <Icon name="scan" />
                         <span>Scan QR</span>
+                      </NavLink>
+                      {/* NEW: Scan Guard (auto-allocate) */}
+                      <NavLink to="/scan-guard" className={linkClass}>
+                        <Icon name="scan" />
+                        <span>Scan Guard</span>
                       </NavLink>
                       <NavLink to="/patrol-tracker" className={linkClass}>
                         <Icon name="tracker" />
