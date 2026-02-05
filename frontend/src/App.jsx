@@ -10,6 +10,7 @@ import Login from "./pages/Login";
 import Allocation from "./pages/Allocation";
 import Attendance from "./pages/Attendance";
 import Patrol from "./pages/Patrol";
+import ScanGuardPage from "./pages/ScanGuard";
 import PatrolTracker from "./components/PatrolTracker";
 import ScanQR from "./components/ScanQR";
 import PatrolMap from "./components/PatrolMap";
@@ -438,6 +439,15 @@ export default function App() {
                 </GuardProtectedRoute>
               }
             />
+            <Route
+             path="/scan-guard"
+              element={
+              <ProtectedRoute>
+                <ScanGuardPage/>
+              </ProtectedRoute>
+            } 
+            />
+
 
             {/* Root -> role-aware redirect */}
             <Route path="/" element={<HomeRedirect />} />

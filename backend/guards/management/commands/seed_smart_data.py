@@ -1,96 +1,117 @@
 # backend/guards/management/commands/seed_smart_data.py
-from django.core.management.base import BaseCommand
-from django.contrib.auth import get_user_model
-from django.utils import timezone
-from django.db import transaction
-from datetime import date, timedelta, time
 import random
+from datetime import date, datetime, time, timedelta
+from io import BytesIO
 
-from guards.models import Premise, GuardProfile, Shift
+from django.core.management.base import BaseCommand
+from django.utils import timezone
+from django.contrib.auth import get_user_model
+
+from guards.models import GuardProfile, Premise, Shift, AttendanceRecord, PatrolCoordinate, Checkpoint, CheckpointLog
 
 User = get_user_model()
 
-ZIM_PREMISES = [
-    ("Main Mall", "Bulawayo CBD"),
-    ("Bulawayo Central Mall", "Bulawayo CBD"),
-    ("Northgate Center", "Harare North"),
-    ("West End Complex", "Gweru"),
-    ("Highfield Plaza", "Harare"),
-    ("Victoria Falls Lodge", "Vic Falls"),
-    ("Mutare City Mall", "Mutare"),
-    ("Killarney Shopping Centre", "Harare"),
-]
-
-SKILL_POOL = ["crowd-control", "customer-service", "first-aid", "cash-handling", "fire-safety", "night-shift"]
 
 class Command(BaseCommand):
-    help = "Seed balanced premises, guards, shifts and generate QR codes. Use --drop to remove existing data."
-
-    def add_arguments(self, parser):
-        parser.add_argument("--drop", action="store_true", help="Delete existing guards/premises/shifts before seeding")
-        parser.add_argument("--guards", type=int, default=30, help="Number of guards to create")
-        parser.add_argument("--start-date", type=str, default=None, help="Start date YYYY-MM-DD for shifts")
-        parser.add_argument("--days", type=int, default=3, help="Number of days to create shifts for")
-        parser.add_argument("--shifts-per-premise", type=int, default=2, help="Shifts per premise per day")
+    help = "Seed a clean minimal dataset for dev/testing: 5 guards, premises, shifts + QR images. Removes existing guard users and related data."
 
     def handle(self, *args, **options):
-        if options["drop"]:
-            self.stdout.write("Deleting existing guard users, profiles, premises, shifts (CAREFUL)...")
-            with transaction.atomic():
-                Shift.objects.all().delete()
-                GuardProfile.objects.all().delete()
-                User.objects.filter(username__startswith="guard_").delete()
-                Premise.objects.filter(name__in=[p[0] for p in ZIM_PREMISES]).delete()
+        self.stdout.write("Starting seed_smart_data...")
 
-        # create premises
-        premises = []
-        for name, addr in ZIM_PREMISES:
-            p, _ = Premise.objects.get_or_create(name=name, defaults={"address": addr})
-            # generate qr image
+        # 0) remove guard-specific data (but keep staff/superusers)
+        self.stdout.write("Removing previous guard users/profiles, related shifts, attendances, patrols...")
+        guard_users = User.objects.filter(is_guard=True)
+        gu_count = guard_users.count()
+        guard_user_ids = list(guard_users.values_list("id", flat=True))
+        # Delete guard-related rows safely
+        AttendanceRecord.objects.filter(guard_id__in=guard_user_ids).delete()
+        PatrolCoordinate.objects.filter(guard_id__in=guard_user_ids).delete()
+        CheckpointLog.objects.filter(guard_id__in=guard_user_ids).delete()
+        Shift.objects.filter(assigned_guard_id__in=guard_user_ids).update(assigned_guard=None, assigned_at=None)
+        GuardProfile.objects.filter(user_id__in=guard_user_ids).delete()
+        # delete guard users themselves
+        guard_users.delete()
+        self.stdout.write(f"Removed {gu_count} guard users and related records.")
+
+        # Optionally remove existing premises/shifts from earlier junk — comment out if you want to keep
+        Premise.objects.all().delete()
+        Shift.objects.all().delete()
+        self.stdout.write("Cleared existing Premise and Shift records (dev-only).")
+
+        # 1) create 5 guards
+        self.stdout.write("Creating 5 guard users & profiles...")
+        guards_spec = [
+            ("guard01", "Mall,retail", 2, "0711111111"),
+            ("guard02", "industrial,patrol", 4, "0712222222"),
+            ("guard03", "hotel,security", 1, "0713333333"),
+            ("guard04", "banking,alarm", 3, "0714444444"),
+            ("guard05", "construction,heavy", 5, "0715555555"),
+        ]
+
+        created_guards = []
+        for uname, skills, exp, phone in guards_spec:
+            u = User.objects.create(username=uname, is_guard=True, is_staff=False, email=f"{uname}@example.test")
+            u.set_password("password")  # dev password
+            u.save()
+            gp = GuardProfile.objects.create(user=u, skills=skills, experience_years=exp, phone=phone)
+            # ensure qr image is generated
+            try:
+                gp.generate_qr_image(force=True)
+                gp.save()
+            except Exception:
+                # if file storage missing, ignore but keep qr_uuid set
+                gp.save()
+            created_guards.append((u, gp))
+            self.stdout.write(f"  - created {uname} with skills [{skills}], uuid={gp.qr_uuid}")
+
+        # 2) create premises matching those skills
+        self.stdout.write("Creating premises (sites)...")
+        premises_spec = [
+            ("Main Mall", "City center shopping mall", "mall,retail"),
+            ("Gweru Industrial Park", "Industrial park and warehouses", "industrial,patrol"),
+            ("Harare Hotel", "Large hotel site", "hotel,security"),
+            ("Central Bank Branch", "Bank branch requiring alarm-trained guards", "banking,alarm"),
+            ("Construction Site A", "Construction site", "construction,heavy"),
+        ]
+        created_premises = []
+        for name, addr, req in premises_spec:
+            p = Premise.objects.create(name=name, address=addr, required_skills=req)
             try:
                 p.generate_qr_image(force=True)
                 p.save()
             except Exception:
-                pass
-            premises.append(p)
+                p.save()
+            created_premises.append(p)
+            self.stdout.write(f"  - created premise {name} (req: {req}) id={p.id} uuid={p.uuid}")
 
-        # create guards
-        guard_count = options["guards"]
-        guards = []
-        for i in range(guard_count):
-            username = f"guard_{i+1:03d}"
-            user, created = User.objects.get_or_create(username=username, defaults={
-                "is_guard": True,
-                "first_name": f"G{i+1}",
-                "email": f"{username}@example.com",
-            })
-            if created:
-                user.set_password("password123")
-                user.save()
-            profile, _ = GuardProfile.objects.get_or_create(user=user, defaults={
-                "skills": ",".join(random.sample(SKILL_POOL, k=random.randint(1, 3))),
-                "experience_years": random.randint(0, 8),
-                "phone": f"+2637{random.randint(100000,999999)}",
-            })
-            profile.generate_qr_image(force=True)
-            profile.save()
-            guards.append((user, profile))
+        # 3) create shifts for today and tomorrow for each premise (morning, evening)
+        today = timezone.localdate()
+        self.stdout.write("Creating shifts for today and tomorrow...")
+        times = [(time(6, 0), time(14, 0)), (time(14, 0), time(22, 0)), (time(22, 0), time(6, 0))]  # third overnight
+        for d in [today, today + timedelta(days=1), today + timedelta(days=2)]:
+            for p in created_premises:
+                for st, et in times:
+                    # For overnight shifts, store end_time less than start_time is allowed (we handle in serializers)
+                    s = Shift.objects.create(premise=p, date=d, start_time=st, end_time=et, required_skills=p.required_skills)
+        self.stdout.write("Shifts created.")
 
-        # create shifts across date range
-        start_date = date.fromisoformat(options["start_date"]) if options["start_date"] else timezone.localdate()
-        days = options["days"]
-        shifts_per_premise = options["shifts_per_premise"]
-        for d in range(days):
-            day = start_date + timedelta(days=d)
-            for p in premises:
-                for s_idx in range(shifts_per_premise):
-                    # morning / evening spreads
-                    if s_idx % 2 == 0:
-                        st = time(hour=8, minute=0)
-                        et = time(hour=16, minute=0)
-                    else:
-                        st = time(hour=16, minute=0)
-                        et = time(hour=23, minute=59)
-                    Shift.objects.create(premise=p, date=day, start_time=st, end_time=et, required_skills=random.choice([p.required_skills or "", ",".join(random.sample(SKILL_POOL, k=1))]) )
+        # 4) quick optional: create a few patrol points to show on map (use last location from each guard)
+        self.stdout.write("Seeding sample patrol coordinates for guards...")
+        for (u, gp) in created_guards:
+            # pick a premise roughly and random lat/lng around Harare (-17.8, 31.0) for demo
+            lat = -17.82 + random.uniform(-0.02, 0.02)
+            lng = 31.04 + random.uniform(-0.02, 0.02)
+            PatrolCoordinate.objects.create(guard=u, shift=Shift.objects.filter(premise__in=created_premises).first(), lat=lat, lng=lng, accuracy=5.0)
+            # update guard profile last seen
+            try:
+                gp.last_seen = timezone.now()
+                gp.last_lat = lat
+                gp.last_lng = lng
+                gp.status = "on_patrol"
+                gp.save(update_fields=["last_seen", "last_lat", "last_lng", "status"])
+            except Exception:
+                gp.save()
 
-        self.stdout.write(self.style.SUCCESS("Seeding complete. Created premises, guards, profiles, shifts and generated QR images."))
+        self.stdout.write(self.style.SUCCESS("Seed complete."))
+        self.stdout.write("Credentials: guard01..guard05 / password")
+        self.stdout.write("Use ScanGuard page or POST /api/allocate/scan_guard/ with guard token or qr_payload.")

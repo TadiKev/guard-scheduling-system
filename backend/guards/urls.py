@@ -1,6 +1,7 @@
 # backend/guards/urls.py
 from rest_framework import routers
 from django.urls import path, include
+
 from .views import (
     UserViewSet,
     GuardProfileViewSet,
@@ -18,7 +19,8 @@ from .views import (
     RecentAssignmentsView,
     GuardAttendanceHistoryView,
     QRCheckInView,
-    RecentGuardAttendanceView
+    RecentGuardAttendanceView,
+    GuardScanAllocateView,  # <-- ensure this name matches the view class in views.py
 )
 
 router = routers.DefaultRouter()
@@ -42,4 +44,7 @@ urlpatterns = [
     path("patrols/heatmap/", PatrolHeatmapView.as_view(), name="patrol-heatmap"),
     path("attendance/checkin/", QRCheckInView.as_view(), name="attendance-checkin"),
     path("attendance/my/", RecentGuardAttendanceView.as_view(), name="attendance-my"),
+
+    # NEW: Guard scan -> auto-allocate endpoint
+    path("allocate/scan_guard/", GuardScanAllocateView.as_view(), name="allocate-scan-guard"),
 ]

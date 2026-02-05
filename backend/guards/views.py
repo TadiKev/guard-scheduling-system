@@ -1000,3 +1000,168 @@ class RecentGuardAttendanceView(APIView):
         qs = AttendanceRecord.objects.filter(guard=request.user).order_by("-check_in_time")[:min(limit, 200)]
         ser = AttendanceSerializer(qs, many=True)
         return Response({"results": ser.data})
+# Add these imports near top of guards/views.py if not already present:
+import json
+from datetime import timedelta
+from django.utils.dateparse import parse_date
+from django.db import transaction
+from django.conf import settings
+from asgiref.sync import async_to_sync
+from channels.layers import get_channel_layer
+from rest_framework.permissions import IsAuthenticated
+
+# Add this view class to guards/views.py
+class GuardScanAllocateView(APIView):
+    """
+    POST /api/allocate/scan_guard/
+    Body (examples):
+      - {}  (if logged in as a guard; backend will use request.user)
+      - {"qr_payload": {"type":"guard","id":21,"uuid":"..."}}
+      - {"qr_payload": {...}, "date": "YYYY-MM-DD"}
+    Response:
+      { "assigned": true/false, "assignment": {...} }  or { "assigned": false, "reason": "..." }
+    """
+    permission_classes = [IsAuthenticated]
+
+    def _parse_qr(self, raw):
+        if raw is None:
+            return None
+        if isinstance(raw, dict):
+            return raw
+        if isinstance(raw, str):
+            try:
+                return json.loads(raw)
+            except Exception:
+                try:
+                    return json.loads(raw.replace("'", '"'))
+                except Exception:
+                    return None
+        return None
+
+    def post(self, request):
+        data = request.data or {}
+
+        # 1) Resolve guard: prefer request.user (if guard)
+        guard = None
+        if getattr(request.user, "is_authenticated", False) and getattr(request.user, "is_guard", False):
+            guard = request.user
+        else:
+            qr_raw = data.get("qr_payload")
+            qr = self._parse_qr(qr_raw)
+            if not qr:
+                return Response({"detail": "qr_payload required when not authenticated as a guard."}, status=status.HTTP_400_BAD_REQUEST)
+            g_uuid = qr.get("uuid") or qr.get("guard_uuid") or qr.get("u")
+            g_id = qr.get("id") or qr.get("guard_id")
+            try:
+                if g_uuid:
+                    gp = GuardProfile.objects.select_related("user").filter(qr_uuid=str(g_uuid)).first()
+                    if gp:
+                        guard = gp.user
+                elif g_id:
+                    guard = User.objects.filter(pk=int(g_id)).first()
+            except Exception:
+                guard = None
+
+        if guard is None:
+            return Response({"assigned": False, "reason": "guard not found"}, status=status.HTTP_400_BAD_REQUEST)
+
+        # 2) Date(s) to consider
+        date_q = data.get("date")
+        if date_q in (None, "", "today"):
+            dates = [timezone.localdate()]
+        else:
+            parsed = parse_date(str(date_q))
+            if not parsed:
+                return Response({"date": "Invalid date format, use YYYY-MM-DD or 'today'."}, status=status.HTTP_400_BAD_REQUEST)
+            dates = [parsed]
+
+        # 3) Gather guard profile info
+        try:
+            guard_profile = guard.profile
+        except Exception:
+            guard_profile = None
+        guard_skills = {s.strip().lower() for s in ((guard_profile.skills if guard_profile else "") or "").split(",") if s.strip()}
+        guard_experience = getattr(guard_profile, "experience_years", 0) or 0
+
+        # 4) Candidate unassigned shifts for those dates
+        candidate_shifts = Shift.objects.filter(date__in=dates, assigned_guard__isnull=True).select_related("premise").order_by("date", "start_time")
+        if not candidate_shifts.exists():
+            return Response({"assigned": False, "reason": "No unassigned shifts for the requested date(s)."}, status=status.HTTP_200_OK)
+
+        # 5) Workload in last 7 days (simple fairness)
+        seven_days_ago = timezone.localdate() - timedelta(days=7)
+        try:
+            workload = AttendanceRecord.objects.filter(guard=guard, check_in_time__date__gte=seven_days_ago).count()
+        except Exception:
+            workload = 0
+
+        # scoring & conflict checks
+        def score_shift(shift):
+            req = {s.strip().lower() for s in (shift.required_skills or "").split(",") if s.strip()}
+            skill_matches = len(req & guard_skills)
+            score = skill_matches * 100 + guard_experience * 5 - workload * 2
+            return score
+
+        def has_conflict_with_existing_assignments(user, shift_to_assign):
+            # overlapping assigned shifts on same date
+            conflicts = Shift.objects.filter(assigned_guard=user, date=shift_to_assign.date).exclude(pk=shift_to_assign.pk)
+            for s in conflicts:
+                if not (s.end_time <= shift_to_assign.start_time or s.start_time >= shift_to_assign.end_time):
+                    return True
+            # simple rest-hours check
+            min_rest_hours = int(getattr(settings, "MIN_REST_HOURS_BETWEEN_SHIFTS", 8))
+            last_assigned = Shift.objects.filter(assigned_guard=user, assigned_at__isnull=False).order_by("-assigned_at").first()
+            if last_assigned and last_assigned.assigned_at:
+                if timezone.now() - last_assigned.assigned_at < timedelta(hours=min_rest_hours):
+                    return True
+            return False
+
+        scored = []
+        for s in candidate_shifts:
+            sc = score_shift(s)
+            scored.append((sc, s))
+        scored.sort(key=lambda x: x[0], reverse=True)
+
+        chosen = None
+        chosen_score = None
+        for sc, s in scored:
+            if has_conflict_with_existing_assignments(guard, s):
+                continue
+            chosen = s
+            chosen_score = sc
+            break
+
+        if not chosen:
+            return Response({"assigned": False, "reason": "No suitable shift found (conflicts or no skill match)."}, status=status.HTTP_200_OK)
+
+        # 6) Atomically assign using select_for_update
+        try:
+            with transaction.atomic():
+                fresh = Shift.objects.select_for_update().get(pk=chosen.pk)
+                if fresh.assigned_guard is not None:
+                    return Response({"assigned": False, "reason": "Shift already assigned by another process."}, status=status.HTTP_200_OK)
+                fresh.assigned_guard = guard
+                fresh.assigned_at = timezone.now()
+                fresh.save(update_fields=["assigned_guard", "assigned_at"])
+
+                payload = {
+                    "shift_id": fresh.id,
+                    "premise_id": fresh.premise.id if fresh.premise else None,
+                    "premise_name": fresh.premise.name if fresh.premise else None,
+                    "assigned_guard_id": guard.id,
+                    "assigned_guard_username": guard.username,
+                    "assigned_at": fresh.assigned_at.isoformat(),
+                    "score": chosen_score,
+                }
+
+                # notify channels (best-effort)
+                try:
+                    layer = get_channel_layer()
+                    async_to_sync(layer.group_send)(f"user_{guard.id}", {"type": "assignment.created", "assignment": payload})
+                    async_to_sync(layer.group_send)("dispatchers", {"type": "assignment.created", "assignment": payload})
+                except Exception:
+                    pass
+
+                return Response({"assigned": True, "assignment": payload}, status=status.HTTP_200_OK)
+        except Shift.DoesNotExist:
+            return Response({"assigned": False, "reason": "Shift disappeared during assignment."}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
