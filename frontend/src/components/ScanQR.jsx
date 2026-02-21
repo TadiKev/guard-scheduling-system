@@ -5,41 +5,49 @@ import api from "../api";
 import AuthContext from "../AuthContext";
 
 /*
-  Improvements:
-  - Avoid sending shift_id: null
-  - Helper makeCheckinBody to normalize payload/shift_id
-  - Console.debug outgoing body for easy Network inspection
-  - Set rawText on scan so force/manual have something to reuse
-  - Defensive safePause/safeResume and lifecycle cleanup
+  ScanQR — improved check-in UX:
+   - shows readable success including premise name, shift id and check-in time
+   - displays assignment payload if backend assigned a shift
+   - keeps camera lifecycle and force/manual fallback behavior
 */
+
+function SmallInfoRow({ label, value }) {
+  if (value === undefined || value === null || value === "") return null;
+  return (
+    <div className="flex justify-between text-sm text-slate-700 py-0.5">
+      <div className="text-slate-400">{label}</div>
+      <div className="font-medium">{String(value)}</div>
+    </div>
+  );
+}
 
 export default function ScanQR() {
   const { token } = useContext(AuthContext);
   const [scanning, setScanning] = useState(false);
+  // message: { type: "info"|"success"|"error", text: string, details?: object }
   const [message, setMessage] = useState(null);
   const [rawText, setRawText] = useState("");
   const [showForceOption, setShowForceOption] = useState(false);
-  const instRef = useRef(null);           // Html5Qrcode instance
-  const mountRef = useRef(null);          // dom node ref
-  const runningRef = useRef(false);       // true when start() succeeded
-  const pausedRef = useRef(false);        // true when paused
-  const mountedRef = useRef(true);        // to check unmounted state
+
+  const instRef = useRef(null); // Html5Qrcode instance
+  const mountRef = useRef(null); // dom node ref
+  const runningRef = useRef(false); // true when start() succeeded
+  const pausedRef = useRef(false); // true when paused
+  const mountedRef = useRef(true); // to check unmounted state
 
   useEffect(() => {
     mountedRef.current = true;
     async function startScanner() {
       try {
         if (!mountRef.current) return;
-        // avoid double start
         if (instRef.current) return;
 
-        const containerId = mountRef.current.id || `qr-reader-${Math.random().toString(36).slice(2,8)}`;
+        const containerId = mountRef.current.id || `qr-reader-${Math.random().toString(36).slice(2, 8)}`;
         mountRef.current.id = containerId;
 
         const html5QrCode = new Html5Qrcode(containerId);
         instRef.current = html5QrCode;
 
-        // start scanning
         setMessage(null);
         setScanning(true);
         try {
@@ -51,15 +59,12 @@ export default function ScanQR() {
           );
           runningRef.current = true;
         } catch (err) {
-          // If start fails (no camera or permission denied)
           runningRef.current = false;
           setScanning(false);
           setMessage({ type: "error", text: "Camera unavailable or permission denied. Use manual fallback below." });
-          // ensure instance cleared
           try { await html5QrCode.clear(); } catch (_) {}
         }
       } catch (err) {
-        // swallow lifecycle errors so React doesn't crash
         console.warn("startScanner error:", err);
       }
     }
@@ -67,21 +72,17 @@ export default function ScanQR() {
     startScanner();
 
     return () => {
-      // cleanup safely
       mountedRef.current = false;
       (async () => {
         try {
           if (instRef.current) {
-            // only stop if we believe it's running
             if (runningRef.current && typeof instRef.current.stop === "function") {
               try {
                 await instRef.current.stop();
               } catch (e) {
-                // ignore known library errors (e.g., "Cannot stop, scanner is not running or paused.")
                 console.debug("stop ignored:", e?.message || e);
               }
             }
-            // always try to clear the DOM bindings
             if (typeof instRef.current.clear === "function") {
               try {
                 await instRef.current.clear();
@@ -103,11 +104,10 @@ export default function ScanQR() {
   }, []);
 
   function onScanFailure(error) {
-    // frequent parse failures are normal; ignore them silently in production
+    // ignore frequent parse failures in production
     // console.debug("scan failure", error);
   }
 
-  // helper to safely pause scanner (if available)
   const safePause = useCallback(async () => {
     if (!instRef.current) return false;
     if (pausedRef.current) return true;
@@ -117,7 +117,6 @@ export default function ScanQR() {
         pausedRef.current = true;
         return true;
       }
-      // if pause not available, we try stop (and mark running=false)
       if (typeof instRef.current.stop === "function" && runningRef.current) {
         await instRef.current.stop();
         runningRef.current = false;
@@ -129,7 +128,6 @@ export default function ScanQR() {
     return false;
   }, []);
 
-  // helper to safely resume scanner (if available)
   const safeResume = useCallback(async () => {
     if (!instRef.current) return false;
     try {
@@ -138,9 +136,7 @@ export default function ScanQR() {
         pausedRef.current = false;
         return true;
       }
-      // if we previously stopped, try to start again (reusing mount id)
       if (!runningRef.current && typeof instRef.current.start === "function" && mountRef.current) {
-        // restart using same callbacks
         await instRef.current.start(
           { facingMode: "environment" },
           { fps: 10, qrbox: { width: 300, height: 300 } },
@@ -157,10 +153,8 @@ export default function ScanQR() {
     return false;
   }, []);
 
-  // helper to build request body and avoid sending shift_id:null
   function makeCheckinBody(payload) {
     const b = { qr_payload: payload || {} };
-    // try multiple common keys
     const sidRaw = payload?.shift_id ?? payload?.shift ?? payload?.shiftId ?? payload?.id ?? null;
     if (sidRaw !== null && sidRaw !== undefined && String(sidRaw).trim() !== "") {
       const sidNum = Number(sidRaw);
@@ -169,21 +163,40 @@ export default function ScanQR() {
     return b;
   }
 
+  // helper to build human-friendly success details and set message
+  function setSuccessFromResponse(data) {
+    // data may contain: premise / premise_name / shift_id / check_in_time / assignment
+    const premiseName = (data.premise && (data.premise.name || data.premise.title)) || data.premise_name || data.premiseName || null;
+    const shiftId = data.shift_id || data.shift?.id || data.assigned_shift_id || null;
+    const checkInTime = data.check_in_time || data.checked_in_at || data.checked_at || null;
+    const assigned = data.assigned === true || data.assignment || false;
+
+    let text;
+    if (premiseName) text = `Checked in successfully to ${premiseName}.`;
+    else if (assigned && data.assignment && data.assignment.premise_name) text = `Assigned & checked in to ${data.assignment.premise_name}.`;
+    else text = "Checked in successfully.";
+
+    const details = {
+      premise_name: premiseName,
+      shift_id: shiftId,
+      check_in_time: checkInTime,
+      assignment: data.assignment || (assigned ? data : null),
+    };
+
+    setMessage({ type: "success", text, details });
+  }
+
   async function onScanSuccess(decodedText, decodedResult) {
-    // immediately avoid double-processing
     try {
-      await safePause(); // graceful pause/stop
+      await safePause();
     } catch (e) {
       console.debug("pause on success ignored:", e?.message || e);
     }
 
     setShowForceOption(false);
     setMessage({ type: "info", text: `Scanned: ${String(decodedText).slice(0, 200)}` });
-
-    // set rawText so force/manual can reuse the last scanned payload
     setRawText(String(decodedText));
 
-    // parse payload
     let payload = null;
     try {
       payload = JSON.parse(decodedText);
@@ -195,7 +208,6 @@ export default function ScanQR() {
 
     const bodyBase = makeCheckinBody(payload);
 
-    // add geolocation if available
     try {
       if (navigator.geolocation) {
         const pos = await new Promise((res, rej) => {
@@ -205,51 +217,47 @@ export default function ScanQR() {
         bodyBase.check_in_lng = pos.coords.longitude;
       }
     } catch (e) {
-      // ignore geolocation errors
+      // ignore
     }
 
-    // debug outgoing body (inspect in Network devtools too)
     console.debug("Checkin body:", bodyBase);
 
-    // perform check-in
     try {
       const res = await api.post("/attendance/checkin/", bodyBase);
-      setMessage({ type: "success", text: "Checked in successfully." });
-      // delay a bit then resume scanner
+      // prefer res.data if available
+      const data = res?.data ?? {};
+      // Use the structured handler to set a success message with premise name etc.
+      setSuccessFromResponse(data);
+
       setTimeout(() => {
         if (mountedRef.current) safeResume();
       }, 1400);
     } catch (err) {
-      // pick useful server message if present
       const server = err?.response?.data;
       if (server) {
-        // If backend sends { detail: [...] } or similar, surface it
+        // If backend sends helpful info (e.g. premise, shift), attempt to include it even on error
+        const premiseName = server?.premise?.name || server?.premise_name || server?.premiseName || null;
         if (Array.isArray(server.detail) && server.detail.length > 0) {
-          setMessage({ type: "error", text: server.detail.join(" ") });
-          // show force option when the failure is specifically about attendance window
+          setMessage({ type: "error", text: server.detail.join(" "), details: { premise_name: premiseName } });
           const joined = server.detail.join(" ").toLowerCase();
-          if (joined.includes("outside allowed window") || joined.includes("outside the allowed window")) {
-            setShowForceOption(true);
-          }
+          if (joined.includes("outside allowed window")) setShowForceOption(true);
         } else if (server.message) {
-          setMessage({ type: "error", text: server.message });
+          setMessage({ type: "error", text: server.message, details: { premise_name: premiseName } });
         } else {
-          setMessage({ type: "error", text: JSON.stringify(server) });
+          setMessage({ type: "error", text: JSON.stringify(server), details: { premise_name: premiseName } });
         }
       } else {
         setMessage({ type: "error", text: err?.message || "Check-in failed" });
       }
 
-      // do not auto-resume immediately if error was critical; resume after a delay so user reads message
       setTimeout(() => {
         if (mountedRef.current) safeResume();
       }, 2000);
     }
   }
 
-  // allow user to attempt force check-in (useful during testing or when backend supports it)
+  // Force check-in (backend must support `force`)
   async function handleForceCheckin() {
-    // try parsing rawText
     let payload = null;
     if (rawText) {
       try { payload = JSON.parse(rawText); } catch (e) {
@@ -271,7 +279,8 @@ export default function ScanQR() {
 
     try {
       const res = await api.post("/attendance/checkin/", body);
-      setMessage({ type: "success", text: "Force check-in succeeded." });
+      const data = res?.data ?? {};
+      setSuccessFromResponse(data);
       setShowForceOption(false);
       setTimeout(() => {
         if (mountedRef.current) safeResume();
@@ -279,7 +288,6 @@ export default function ScanQR() {
     } catch (err) {
       const server = err?.response?.data;
       setMessage({ type: "error", text: server ? JSON.stringify(server) : (err?.message || "Force check-in failed") });
-      // resume scanner after short delay
       setTimeout(() => {
         if (mountedRef.current) safeResume();
       }, 1800);
@@ -304,15 +312,16 @@ export default function ScanQR() {
 
     try {
       const res = await api.post("/attendance/checkin/", body);
-      setMessage({ type: "success", text: "Manual check-in succeeded." });
+      const data = res?.data ?? {};
+      setSuccessFromResponse(data);
     } catch (err) {
       const server = err?.response?.data;
       if (server && Array.isArray(server.detail)) {
-        setMessage({ type: "error", text: server.detail.join(" ") });
+        setMessage({ type: "error", text: server.detail.join(" "), details: {} });
         const joined = server.detail.join(" ").toLowerCase();
         if (joined.includes("outside allowed window")) setShowForceOption(true);
       } else {
-        setMessage({ type: "error", text: JSON.stringify(server || err?.message) });
+        setMessage({ type: "error", text: JSON.stringify(server || err?.message), details: {} });
       }
     }
   }
@@ -323,20 +332,57 @@ export default function ScanQR() {
 
       <div id="qr-reader" ref={mountRef} style={{ width: "100%", height: 360 }} className="mb-3" />
 
-      {message && (
-        <div
-          className={`p-2 mb-3 ${message.type === "error" ? "bg-rose-50 text-rose-700" : "bg-emerald-50 text-emerald-700"} rounded`}
-        >
-          {message.text}
+      {/* Message area */}
+      {message && message.type === "info" && (
+        <div className="p-2 mb-3 bg-slate-100 text-slate-700 rounded">{message.text}</div>
+      )}
+
+      {message && message.type === "success" && (
+        <div className="p-3 mb-3 rounded border bg-emerald-50 border-emerald-200">
+          <div className="font-semibold text-emerald-800 mb-1">{message.text}</div>
+          {/* details */}
+          {message.details && (
+            <div className="bg-white p-3 rounded border">
+              <SmallInfoRow label="Premise" value={message.details.premise_name} />
+              <SmallInfoRow label="Shift ID" value={message.details.shift_id ? `#${message.details.shift_id}` : null} />
+              <SmallInfoRow label="Check-in time" value={
+                message.details.check_in_time ? new Date(message.details.check_in_time).toLocaleString() : null
+              } />
+              {/* if backend returned assignment object show it */}
+              {message.details.assignment && (
+                <>
+                  <div className="text-xs text-slate-500 mt-2 mb-1">Assignment details</div>
+                  <SmallInfoRow label="Assigned guard" value={message.details.assignment.guard_username || message.details.assignment.assigned_guard_id} />
+                  <SmallInfoRow label="Assignment score" value={message.details.assignment.score ?? null} />
+                </>
+              )}
+            </div>
+          )}
+        </div>
+      )}
+
+      {message && message.type === "error" && (
+        <div className="p-2 mb-3 rounded bg-rose-50 text-rose-700 border border-rose-100">
+          <div className="font-semibold">Check-in failed</div>
+          <div className="text-sm mt-1">{message.text}</div>
+          {message.details && message.details.premise_name && (
+            <div className="text-xs mt-2 text-slate-500">Premise: {message.details.premise_name}</div>
+          )}
         </div>
       )}
 
       {showForceOption && (
         <div className="mb-3">
-          <div className="text-sm text-slate-600 mb-2">The backend rejected the check-in due to attendance window. You can retry with force (only use if permitted).</div>
+          <div className="text-sm text-slate-600 mb-2">
+            The backend rejected the check-in due to the attendance window. Retry with force (only use if permitted).
+          </div>
           <div className="flex gap-2">
-            <button type="button" onClick={handleForceCheckin} className="px-3 py-2 bg-amber-600 text-white rounded">Retry with force</button>
-            <button type="button" onClick={() => setShowForceOption(false)} className="px-3 py-2 bg-slate-100 rounded">Dismiss</button>
+            <button type="button" onClick={handleForceCheckin} className="px-3 py-2 bg-amber-600 text-white rounded">
+              Retry with force
+            </button>
+            <button type="button" onClick={() => setShowForceOption(false)} className="px-3 py-2 bg-slate-100 rounded">
+              Dismiss
+            </button>
           </div>
         </div>
       )}
@@ -359,7 +405,7 @@ export default function ScanQR() {
       </div>
 
       <div className="text-xs text-slate-400 mt-3">
-        Tip: QR payload should contain an `id` or `uuid` matching the premise/shift or a `shift_id`.
+        Tip: QR payload should contain an <code>id</code> or <code>uuid</code> matching the premise/shift or a <code>shift_id</code>.
       </div>
     </div>
   );

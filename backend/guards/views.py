@@ -1000,27 +1000,143 @@ class RecentGuardAttendanceView(APIView):
         qs = AttendanceRecord.objects.filter(guard=request.user).order_by("-check_in_time")[:min(limit, 200)]
         ser = AttendanceSerializer(qs, many=True)
         return Response({"results": ser.data})
-# Add these imports near top of guards/views.py if not already present:
+# backend/guards/views.py
+# Add / replace these imports at the top of your views.py
 import json
-from datetime import timedelta
-from django.utils.dateparse import parse_date
+from datetime import datetime, timedelta, date
+from django.utils import timezone
 from django.db import transaction
-from django.conf import settings
+from django.db.models import Count, Q
+from rest_framework.views import APIView
+from rest_framework.response import Response
+from rest_framework.permissions import IsAuthenticated
+from rest_framework import status
 from asgiref.sync import async_to_sync
 from channels.layers import get_channel_layer
-from rest_framework.permissions import IsAuthenticated
 
-# Add this view class to guards/views.py
+from django.shortcuts import get_object_or_404
+from django.contrib.auth import get_user_model
+
+from .models import AttendanceRecord, Shift, Premise, GuardProfile
+
+User = get_user_model()
+
+
+class DashboardAnalyticsView(APIView):
+    """
+    GET /api/dashboard/analytics/
+    Returns JSON:
+      - attendance_last_7_days
+      - attendance_last_30_days
+      - monthly_compliance (last 12 months)
+      - workload (top guards recent)
+    """
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        today = timezone.localdate()
+
+        # --- last 7 days ---
+        start7 = today - timedelta(days=6)
+        attendance_last_7_days = []
+        for i in range(7):
+            d = start7 + timedelta(days=i)
+            on_time = AttendanceRecord.objects.filter(check_in_time__date=d, status="ON_TIME").count()
+            late = AttendanceRecord.objects.filter(check_in_time__date=d, status="LATE").count()
+            total = AttendanceRecord.objects.filter(check_in_time__date=d).count()
+            shifts_count = Shift.objects.filter(date=d).count()
+            absent = max(0, shifts_count - total)
+            attendance_last_7_days.append({
+                "date": d.isoformat(),
+                "on_time": on_time,
+                "late": late,
+                "absent": absent,
+                "total": total,
+            })
+
+        # --- last 30 days ---
+        start30 = today - timedelta(days=29)
+        attendance_last_30_days = []
+        for i in range(30):
+            d = start30 + timedelta(days=i)
+            on_time = AttendanceRecord.objects.filter(check_in_time__date=d, status="ON_TIME").count()
+            late = AttendanceRecord.objects.filter(check_in_time__date=d, status="LATE").count()
+            total = AttendanceRecord.objects.filter(check_in_time__date=d).count()
+            shifts_count = Shift.objects.filter(date=d).count()
+            absent = max(0, shifts_count - total)
+            on_time_pct = int(on_time * 100 / total) if total else None
+            attendance_last_30_days.append({
+                "date": d.isoformat(),
+                "on_time": on_time,
+                "late": late,
+                "absent": absent,
+                "total": total,
+                "on_time_pct": on_time_pct,
+            })
+
+        # --- monthly compliance (last 12 months, oldest first) ---
+        monthly_compliance = []
+        # compute months from 11 months ago up to current month
+        for offset in range(11, -1, -1):
+            # compute year/month by subtracting offset months
+            month = today.month - offset
+            year = today.year
+            while month <= 0:
+                month += 12
+                year -= 1
+            month_start = date(year, month, 1)
+            # compute start of next month
+            if month == 12:
+                next_month_start = date(year + 1, 1, 1)
+            else:
+                next_month_start = date(year, month + 1, 1)
+            month_end = next_month_start - timedelta(days=1)
+
+            on_time = AttendanceRecord.objects.filter(check_in_time__date__gte=month_start, check_in_time__date__lte=month_end, status="ON_TIME").count()
+            late = AttendanceRecord.objects.filter(check_in_time__date__gte=month_start, check_in_time__date__lte=month_end, status="LATE").count()
+            total = AttendanceRecord.objects.filter(check_in_time__date__gte=month_start, check_in_time__date__lte=month_end).count()
+            shifts_count = Shift.objects.filter(date__gte=month_start, date__lte=month_end).count()
+            absent = max(0, shifts_count - total)
+            on_time_pct = int(on_time * 100 / total) if total else None
+
+            monthly_compliance.append({
+                "year": year,
+                "month": month,
+                "month_label": month_start.strftime("%Y-%m"),
+                "on_time": on_time,
+                "late": late,
+                "total": total,
+                "shifts_count": shifts_count,
+                "absent": absent,
+                "on_time_pct": on_time_pct,
+            })
+
+        # --- workload: top guards by checkins in last 7 days ---
+        wl_start = today - timedelta(days=6)
+        wl = AttendanceRecord.objects.filter(check_in_time__date__gte=wl_start).values("guard__username").annotate(on_checkins=Count("id")).order_by("-on_checkins")[:50]
+        workload = [{"username": v["guard__username"], "checkins": v["on_checkins"]} for v in wl]
+
+        return Response({
+            "attendance_last_7_days": attendance_last_7_days,
+            "attendance_last_30_days": attendance_last_30_days,
+            "monthly_compliance": monthly_compliance,
+            "workload": workload,
+        })
+
+
+# backend/guards/views.py  (or wherever GuardScanAllocateView lives)
+import json
+from django.utils import timezone
+from django.db import transaction
+from asgiref.sync import async_to_sync
+from channels.layers import get_channel_layer
+from rest_framework.views import APIView
+from rest_framework.response import Response
+from rest_framework import status
+
+# ... keep your existing imports above (Shift, GuardProfile, etc) ...
+
 class GuardScanAllocateView(APIView):
-    """
-    POST /api/allocate/scan_guard/
-    Body (examples):
-      - {}  (if logged in as a guard; backend will use request.user)
-      - {"qr_payload": {"type":"guard","id":21,"uuid":"..."}}
-      - {"qr_payload": {...}, "date": "YYYY-MM-DD"}
-    Response:
-      { "assigned": true/false, "assignment": {...} }  or { "assigned": false, "reason": "..." }
-    """
     permission_classes = [IsAuthenticated]
 
     def _parse_qr(self, raw):
@@ -1040,128 +1156,196 @@ class GuardScanAllocateView(APIView):
 
     def post(self, request):
         data = request.data or {}
+        qr_raw = data.get("qr_payload")
+        qr = self._parse_qr(qr_raw)
 
-        # 1) Resolve guard: prefer request.user (if guard)
-        guard = None
-        if getattr(request.user, "is_authenticated", False) and getattr(request.user, "is_guard", False):
-            guard = request.user
-        else:
-            qr_raw = data.get("qr_payload")
-            qr = self._parse_qr(qr_raw)
-            if not qr:
-                return Response({"detail": "qr_payload required when not authenticated as a guard."}, status=status.HTTP_400_BAD_REQUEST)
-            g_uuid = qr.get("uuid") or qr.get("guard_uuid") or qr.get("u")
-            g_id = qr.get("id") or qr.get("guard_id")
+        # Resolve guard profile: priority QR -> authenticated user (if guard)
+        guard_profile = None
+        if qr:
+            qr_uuid = qr.get("uuid") or qr.get("qr_uuid") or qr.get("u")
+            qr_id = qr.get("id") or qr.get("guard_id") or qr.get("gid")
+            if qr_uuid:
+                guard_profile = GuardProfile.objects.select_related("user").filter(qr_uuid=str(qr_uuid)).first()
+            elif qr_id:
+                try:
+                    uid = int(qr_id)
+                    guard_profile = GuardProfile.objects.select_related("user").filter(user__id=uid).first()
+                except Exception:
+                    guard_profile = None
+
+        if not guard_profile:
+            user = getattr(request, "user", None)
+            if not user or not getattr(user, "is_authenticated", False):
+                return Response({"assigned": False, "reason": "Authentication required or valid guard QR payload."}, status=status.HTTP_400_BAD_REQUEST)
+            if not getattr(user, "is_guard", False):
+                return Response({"assigned": False, "reason": "Only guards can perform scan-allocation."}, status=status.HTTP_403_FORBIDDEN)
             try:
-                if g_uuid:
-                    gp = GuardProfile.objects.select_related("user").filter(qr_uuid=str(g_uuid)).first()
-                    if gp:
-                        guard = gp.user
-                elif g_id:
-                    guard = User.objects.filter(pk=int(g_id)).first()
+                guard_profile = user.profile
             except Exception:
-                guard = None
+                return Response({"assigned": False, "reason": "Guard profile not found for user."}, status=status.HTTP_400_BAD_REQUEST)
 
-        if guard is None:
-            return Response({"assigned": False, "reason": "guard not found"}, status=status.HTTP_400_BAD_REQUEST)
+        guard_user = guard_profile.user
 
-        # 2) Date(s) to consider
-        date_q = data.get("date")
+        # target date(s) - default today
+        date_q = data.get("date", None)
+        target_dates = []
         if date_q in (None, "", "today"):
-            dates = [timezone.localdate()]
+            target_dates = [timezone.localdate()]
         else:
-            parsed = parse_date(str(date_q))
-            if not parsed:
-                return Response({"date": "Invalid date format, use YYYY-MM-DD or 'today'."}, status=status.HTTP_400_BAD_REQUEST)
-            dates = [parsed]
+            try:
+                from django.utils.dateparse import parse_date
+                parsed = parse_date(str(date_q))
+                if not parsed:
+                    return Response({"assigned": False, "reason": "Invalid date format"}, status=status.HTTP_400_BAD_REQUEST)
+                target_dates = [parsed]
+            except Exception:
+                target_dates = [timezone.localdate()]
 
-        # 3) Gather guard profile info
-        try:
-            guard_profile = guard.profile
-        except Exception:
-            guard_profile = None
-        guard_skills = {s.strip().lower() for s in ((guard_profile.skills if guard_profile else "") or "").split(",") if s.strip()}
-        guard_experience = getattr(guard_profile, "experience_years", 0) or 0
+        # helper: score guard for skills
+        def score_guard_for_skills(gp, required_skills):
+            req_set = {s.strip().lower() for s in (required_skills or "").split(",") if s.strip()}
+            guard_set = {s.strip().lower() for s in (gp.skills or "").split(",") if s.strip()}
+            matches = len(req_set & guard_set)
+            return matches * 10 + (gp.experience_years or 0)
 
-        # 4) Candidate unassigned shifts for those dates
-        candidate_shifts = Shift.objects.filter(date__in=dates, assigned_guard__isnull=True).select_related("premise").order_by("date", "start_time")
-        if not candidate_shifts.exists():
-            return Response({"assigned": False, "reason": "No unassigned shifts for the requested date(s)."}, status=status.HTTP_200_OK)
+        # helper: compute matched skills list (preserve guard skill token text for display)
+        def compute_matched_skills(guard_skills_str, required_skills_str):
+            if not guard_skills_str:
+                return []
+            if not required_skills_str:
+                return []
+            guard_tokens = [s.strip() for s in guard_skills_str.split(",") if s.strip()]
+            prem_tokens = [s.strip() for s in required_skills_str.split(",") if s.strip()]
+            g_lower = [g.lower() for g in guard_tokens]
+            p_lower = [p.lower() for p in prem_tokens]
+            matched = []
+            for i, p in enumerate(p_lower):
+                # exact
+                if p in g_lower:
+                    matched.append(guard_tokens[g_lower.index(p)])
+                    continue
+                # partial contains
+                found = False
+                for j, g in enumerate(g_lower):
+                    if g.find(p) != -1 or p.find(g) != -1:
+                        matched.append(guard_tokens[j])
+                        found = True
+                        break
+                if found:
+                    continue
+                # token intersection
+                p_tokens = p.split()
+                for j, g in enumerate(g_lower):
+                    g_tokens = g.split()
+                    if any(tok in g_tokens for tok in p_tokens):
+                        matched.append(guard_tokens[j])
+                        break
+            # dedupe preserving order
+            seen = set()
+            out = []
+            for it in matched:
+                if it not in seen:
+                    seen.add(it)
+                    out.append(it)
+            return out
 
-        # 5) Workload in last 7 days (simple fairness)
-        seven_days_ago = timezone.localdate() - timedelta(days=7)
-        try:
-            workload = AttendanceRecord.objects.filter(guard=guard, check_in_time__date__gte=seven_days_ago).count()
-        except Exception:
-            workload = 0
-
-        # scoring & conflict checks
-        def score_shift(shift):
-            req = {s.strip().lower() for s in (shift.required_skills or "").split(",") if s.strip()}
-            skill_matches = len(req & guard_skills)
-            score = skill_matches * 100 + guard_experience * 5 - workload * 2
-            return score
-
-        def has_conflict_with_existing_assignments(user, shift_to_assign):
-            # overlapping assigned shifts on same date
-            conflicts = Shift.objects.filter(assigned_guard=user, date=shift_to_assign.date).exclude(pk=shift_to_assign.pk)
+        # helper: conflict check
+        def guard_conflicts(g_user, shift_to_assign):
+            if not g_user:
+                return True
+            conflicts = Shift.objects.filter(assigned_guard=g_user, date=shift_to_assign.date).exclude(pk=shift_to_assign.pk)
             for s in conflicts:
                 if not (s.end_time <= shift_to_assign.start_time or s.start_time >= shift_to_assign.end_time):
                     return True
-            # simple rest-hours check
-            min_rest_hours = int(getattr(settings, "MIN_REST_HOURS_BETWEEN_SHIFTS", 8))
-            last_assigned = Shift.objects.filter(assigned_guard=user, assigned_at__isnull=False).order_by("-assigned_at").first()
-            if last_assigned and last_assigned.assigned_at:
-                if timezone.now() - last_assigned.assigned_at < timedelta(hours=min_rest_hours):
-                    return True
             return False
 
-        scored = []
-        for s in candidate_shifts:
-            sc = score_shift(s)
-            scored.append((sc, s))
-        scored.sort(key=lambda x: x[0], reverse=True)
+        channel_layer = get_channel_layer()
+        notify = lambda uid, payload: async_to_sync(channel_layer.group_send)(f"user_{uid}", {"type": "assignment.created", "assignment": payload}) if channel_layer else None
 
-        chosen = None
-        chosen_score = None
-        for sc, s in scored:
-            if has_conflict_with_existing_assignments(guard, s):
-                continue
-            chosen = s
-            chosen_score = sc
-            break
+        assigned_payload = None
+        with transaction.atomic():
+            for d in target_dates:
+                shifts_qs = Shift.objects.select_for_update().filter(date=d, assigned_guard__isnull=True).order_by("start_time")
+                if not shifts_qs.exists():
+                    continue
 
-        if not chosen:
-            return Response({"assigned": False, "reason": "No suitable shift found (conflicts or no skill match)."}, status=status.HTTP_200_OK)
+                candidates = []
+                for s in shifts_qs:
+                    req = s.required_skills or ""
+                    score = score_guard_for_skills(guard_profile, req)
+                    if req.strip() and score == 0:
+                        continue
+                    if guard_conflicts(guard_user, s):
+                        continue
+                    candidates.append((score, s))
 
-        # 6) Atomically assign using select_for_update
-        try:
-            with transaction.atomic():
-                fresh = Shift.objects.select_for_update().get(pk=chosen.pk)
+                candidates.sort(key=lambda x: (-x[0], x[1].start_time))
+
+                if not candidates:
+                    continue
+
+                top_score, top_shift = candidates[0]
+                fresh = Shift.objects.select_for_update().get(pk=top_shift.pk)
                 if fresh.assigned_guard is not None:
-                    return Response({"assigned": False, "reason": "Shift already assigned by another process."}, status=status.HTTP_200_OK)
-                fresh.assigned_guard = guard
+                    # try other candidates
+                    assigned = False
+                    for score_val, s2 in candidates[1:]:
+                        fresh2 = Shift.objects.select_for_update().get(pk=s2.pk)
+                        if fresh2.assigned_guard is None:
+                            fresh2.assigned_guard = guard_user
+                            fresh2.assigned_at = timezone.now()
+                            fresh2.save(update_fields=["assigned_guard", "assigned_at"])
+                            # build payload including skills/matched_skills for UI transparency
+                            payload = {
+                                "shift_id": fresh2.id,
+                                "assigned_guard_id": guard_user.id,
+                                "guard_username": guard_user.username,
+                                "score": score_val,
+                                "assigned_at": fresh2.assigned_at.isoformat(),
+                                "premise_id": fresh2.premise.id if fresh2.premise else None,
+                                "premise_name": fresh2.premise.name if fresh2.premise else None,
+                                "guard_skills": (guard_profile.skills or ""),
+                                "premise_required_skills": (fresh2.required_skills or fresh2.premise.required_skills if fresh2.premise else "") ,
+                                "matched_skills": compute_matched_skills(guard_profile.skills or "", (fresh2.required_skills or (fresh2.premise.required_skills if fresh2.premise else ""))),
+                            }
+                            notify(guard_user.id, payload)
+                            assigned_payload = payload
+                            assigned = True
+                            break
+                    if assigned:
+                        break
+                    else:
+                        continue
+
+                # assign top
+                fresh.assigned_guard = guard_user
                 fresh.assigned_at = timezone.now()
                 fresh.save(update_fields=["assigned_guard", "assigned_at"])
-
                 payload = {
                     "shift_id": fresh.id,
+                    "assigned_guard_id": guard_user.id,
+                    "guard_username": guard_user.username,
+                    "score": top_score,
+                    "assigned_at": fresh.assigned_at.isoformat(),
                     "premise_id": fresh.premise.id if fresh.premise else None,
                     "premise_name": fresh.premise.name if fresh.premise else None,
-                    "assigned_guard_id": guard.id,
-                    "assigned_guard_username": guard.username,
-                    "assigned_at": fresh.assigned_at.isoformat(),
-                    "score": chosen_score,
+                    "guard_skills": (guard_profile.skills or ""),
+                    "premise_required_skills": (fresh.required_skills or (fresh.premise.required_skills if fresh.premise else "")),
+                    "matched_skills": compute_matched_skills(guard_profile.skills or "", (fresh.required_skills or (fresh.premise.required_skills if fresh.premise else ""))),
                 }
+                notify(guard_user.id, payload)
+                assigned_payload = payload
+                break
 
-                # notify channels (best-effort)
-                try:
-                    layer = get_channel_layer()
-                    async_to_sync(layer.group_send)(f"user_{guard.id}", {"type": "assignment.created", "assignment": payload})
-                    async_to_sync(layer.group_send)("dispatchers", {"type": "assignment.created", "assignment": payload})
-                except Exception:
-                    pass
-
-                return Response({"assigned": True, "assignment": payload}, status=status.HTTP_200_OK)
-        except Shift.DoesNotExist:
-            return Response({"assigned": False, "reason": "Shift disappeared during assignment."}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        if assigned_payload:
+            return Response({"assigned": True, **assigned_payload})
+        else:
+            # include guard_skills in negative response to help frontend display what was checked
+            return Response(
+                {
+                    "assigned": False,
+                    "reason": "No suitable shift found (conflicts or no skill match).",
+                    "guard_skills": (guard_profile.skills or ""),
+                },
+                status=status.HTTP_200_OK,
+            )

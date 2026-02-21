@@ -1,6 +1,6 @@
 // frontend/src/App.jsx
-import React, { useContext } from "react";
-import { BrowserRouter, Routes, Route, NavLink, Link, Navigate } from "react-router-dom";
+import React, { useContext, useState, useEffect } from "react";
+import { BrowserRouter, Routes, Route, NavLink, Link, Navigate, useLocation } from "react-router-dom";
 import AuthContext from "./AuthContext";
 
 /*
@@ -101,6 +101,18 @@ function Icon({ name, className = "h-4 w-4 inline-block mr-2" }) {
           <path d="M12 7v6l4 2" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" fill="none" />
         </svg>
       );
+    case "menu":
+      return (
+        <svg {...common} aria-hidden>
+          <path d="M3 6h18M3 12h18M3 18h18" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" />
+        </svg>
+      );
+    case "close":
+      return (
+        <svg {...common} aria-hidden>
+          <path d="M6 6l12 12M18 6L6 18" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" />
+        </svg>
+      );
     default:
       return null;
   }
@@ -109,6 +121,13 @@ function Icon({ name, className = "h-4 w-4 inline-block mr-2" }) {
 /* NavBar built here so routes and header remain consistent project-wide */
 function NavBar() {
   const { token, user, logout } = useContext(AuthContext);
+  const [mobileOpen, setMobileOpen] = useState(false);
+  const location = useLocation();
+
+  // close mobile menu automatically on navigation change
+  useEffect(() => {
+    setMobileOpen(false);
+  }, [location.pathname]);
 
   const linkClass = ({ isActive }) =>
     `group flex items-center gap-2 px-3 py-2 rounded-full text-sm transition-transform transform hover:-translate-y-0.5 hover:scale-[1.02] focus:outline-none focus:ring-2 focus:ring-emerald-300 ${
@@ -136,11 +155,11 @@ function NavBar() {
                   <div className="rounded-md p-1 bg-gradient-to-r from-emerald-500 to-cyan-400 shadow-lg transform-gpu animate-[float_6s_ease-in-out_infinite]">
                     <div className="px-3 py-1 text-white font-extrabold tracking-tight text-sm">SG</div>
                   </div>
-                  <div>
-                    <div className="text-lg font-extrabold text-slate-800 leading-tight bg-clip-text text-transparent bg-gradient-to-r from-slate-900 to-slate-600">
+                  <div className="min-w-0">
+                    <div className="text-lg font-extrabold text-slate-800 leading-tight truncate">
                       Smart Guards
                     </div>
-                    <div className="text-xs text-slate-400">Allocation & Shift Management</div>
+                    <div className="text-xs text-slate-400 truncate">Allocation & Shift Management</div>
                   </div>
                 </Link>
                 <div className="flex items-center gap-3">
@@ -159,21 +178,40 @@ function NavBar() {
   const isAdmin = Boolean(user?.is_admin);
   const isGuard = Boolean(user?.is_guard);
 
+  // nav link collections for easier mobile rendering
+  const adminLinks = [
+    { to: "/dashboard", label: "Dashboard", icon: "dashboard" },
+    { to: "/allocation", label: "Allocation", icon: "allocation" },
+    { to: "/attendance", label: "Attendance", icon: "attendance" },
+    { to: "/patrol", label: "Patrols", icon: "patrol" },
+    { to: "/map", label: "Map", icon: "map" },
+    { to: "/analytics", label: "Analytics", icon: "analytics" },
+  ];
+
+  const guardLinks = [
+    { to: "/guard", label: "Guard View", icon: "guard" },
+    { to: "/scan", label: "Scan QR", icon: "scan" },
+    { to: "/scan-guard", label: "Scan Guard", icon: "scan" },
+    { to: "/patrol-tracker", label: "Patrol Tracker", icon: "tracker" },
+  ];
+
+  const fallbackLink = [{ to: "/scan", label: "Scan QR", icon: "scan" }];
+
   return (
     <header className="sticky top-0 z-40">
       <div className="relative">
-        {/* subtle animated background glow */} 
+        {/* subtle animated background glow */}
         <div className="absolute -top-6 left-1/2 -translate-x-1/2 w-[1200px] h-36 rounded-full bg-gradient-to-r from-emerald-300 via-cyan-200 to-indigo-300 opacity-10 blur-3xl pointer-events-none" />
 
         <div className="bg-white/75 backdrop-blur-md border-b border-slate-100 shadow-lg">
           <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
-            <div className="flex items-center justify-between h-16">
+            <div className="flex items-center justify-between h-16 gap-3">
               {/* Left: Brand + role badge */}
-              <div className="flex items-center gap-3">
-                <Link to="/" className="flex items-center gap-3">
+              <div className="flex items-center gap-3 min-w-0">
+                <Link to="/" className="flex items-center gap-3 min-w-0">
                   <div className="rounded-md p-1 bg-gradient-to-r from-emerald-500 to-cyan-400 shadow-xl transform-gpu">
                     <div className="px-3 py-1 text-white font-extrabold tracking-tight text-sm flex items-center gap-2">
-                      <span className="animate-spin-slow inline-block">
+                      <span className="animate-spin-slow inline-block" aria-hidden>
                         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" className="text-white" xmlns="http://www.w3.org/2000/svg">
                           <path d="M12 2v4" stroke="white" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" />
                           <path d="M12 22v-4" stroke="white" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" />
@@ -183,14 +221,13 @@ function NavBar() {
                       SG
                     </div>
                   </div>
-                  <div>
-                    <div className="text-lg font-extrabold text-slate-800 leading-tight bg-clip-text text-transparent bg-gradient-to-r from-slate-900 to-slate-600">
-                      Smart Guards
-                    </div>
-                    <div className="text-xs text-slate-400">Allocation & Shift Management</div>
+                  <div className="min-w-0">
+                    <div className="text-lg font-extrabold text-slate-800 leading-tight truncate">Smart Guards</div>
+                    <div className="text-xs text-slate-400 truncate">Allocation & Shift Management</div>
                   </div>
                 </Link>
-                <div className="ml-3">
+
+                <div className="ml-3 hidden sm:block">
                   <span
                     className={`inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium ${
                       isAdmin ? "bg-indigo-100 text-indigo-800 ring-1 ring-indigo-50" : isGuard ? "bg-emerald-100 text-emerald-800 ring-1 ring-emerald-50" : "bg-slate-100 text-slate-800"
@@ -201,8 +238,8 @@ function NavBar() {
                 </div>
               </div>
 
-              {/* Right: Nav links + Notifier + Auth */}
-              <div className="flex items-center gap-4">
+              {/* Right: Desktop nav + Notifier + Auth */}
+              <div className="hidden md:flex items-center gap-4 flex-1 justify-end">
                 <nav className="flex items-center gap-2" aria-label="Primary navigation">
                   {/* Admin-only Dashboard */}
                   {isAdmin && (
@@ -255,7 +292,7 @@ function NavBar() {
                       {/* NEW: Scan Guard (auto-allocate) */}
                       <NavLink to="/scan-guard" className={linkClass}>
                         <Icon name="scan" />
-                        <span>Scan Guard</span>
+                        <span>Auto Allocate</span>
                       </NavLink>
                       <NavLink to="/patrol-tracker" className={linkClass}>
                         <Icon name="tracker" />
@@ -289,7 +326,7 @@ function NavBar() {
 
                 {/* Auth controls */}
                 <div className="flex items-center gap-3 ml-2">
-                  <div className="text-sm text-slate-700 hidden sm:block">
+                  <div className="text-sm text-slate-700 hidden sm:block truncate">
                     Hi{user?.username ? `, ${user.username}` : ""}
                   </div>
                   <button
@@ -301,11 +338,115 @@ function NavBar() {
                   </button>
                 </div>
               </div>
+
+              {/* Mobile: hamburger (right side) */}
+              <div className="md:hidden flex items-center">
+                <button
+                  onClick={() => setMobileOpen((s) => !s)}
+                  aria-expanded={mobileOpen}
+                  aria-controls="mobile-menu"
+                  className="p-2 rounded-md bg-white/60 shadow hover:bg-white focus:outline-none focus:ring-2 focus:ring-emerald-300"
+                >
+                  <Icon name={mobileOpen ? "close" : "menu"} className="h-5 w-5" />
+                </button>
+              </div>
             </div>
           </div>
 
           {/* bottom decorative gradient border */}
           <div className="h-1 bg-gradient-to-r from-emerald-200 via-cyan-200 to-indigo-200 opacity-50" />
+        </div>
+
+        {/* Mobile slide-down panel (keeps DOM simple and accessible) */}
+        <div
+          id="mobile-menu"
+          className={`md:hidden transition-[opacity,transform] duration-200 ease-out ${mobileOpen ? "opacity-100 translate-y-0" : "opacity-0 -translate-y-2 pointer-events-none"}`}
+          aria-hidden={!mobileOpen}
+        >
+          <div className="mx-4 mt-3 bg-white rounded-xl border border-slate-100 shadow-lg p-4">
+            <div className="flex items-center justify-between mb-3">
+              <div className="flex items-center gap-3 min-w-0">
+                <div className="rounded-md p-1 bg-gradient-to-r from-emerald-500 to-cyan-400 shadow">
+                  <div className="px-2 py-0.5 text-white font-bold text-sm">SG</div>
+                </div>
+                <div className="min-w-0">
+                  <div className="text-sm font-semibold text-slate-800 truncate">Smart Guards</div>
+                  <div className="text-xs text-slate-500 truncate">A Smart Guard Allocation and Shift Management System</div>
+                </div>
+              </div>
+              <div className="flex items-center gap-2">
+                {(isAdmin || isGuard) && (
+                  <div className="p-1 rounded-md bg-white/60 backdrop-blur-sm shadow-inner">
+                    <AssignmentNotifier />
+                  </div>
+                )}
+                <button onClick={() => setMobileOpen(false)} aria-label="Close menu" className="p-1 rounded-md">
+                  <Icon name="close" />
+                </button>
+              </div>
+            </div>
+
+            <nav className="flex flex-col gap-2" aria-label="Mobile navigation">
+              {isAdmin &&
+                adminLinks.map((l) => (
+                  <NavLink
+                    key={l.to}
+                    to={l.to}
+                    className={({ isActive }) =>
+                      `flex items-center gap-3 px-3 py-2 rounded-md text-sm ${isActive ? "bg-emerald-50 text-slate-900 font-semibold" : "text-slate-700 hover:bg-slate-50"}`
+                    }
+                  >
+                    <Icon name={l.icon} />
+                    <span>{l.label}</span>
+                  </NavLink>
+                ))}
+
+              {isGuard &&
+                guardLinks.map((l) => (
+                  <NavLink
+                    key={l.to}
+                    to={l.to}
+                    className={({ isActive }) =>
+                      `flex items-center gap-3 px-3 py-2 rounded-md text-sm ${isActive ? "bg-emerald-50 text-slate-900 font-semibold" : "text-slate-700 hover:bg-slate-50"}`
+                    }
+                  >
+                    <Icon name={l.icon} />
+                    <span>{l.label}</span>
+                  </NavLink>
+                ))}
+
+              {!isAdmin &&
+                !isGuard &&
+                fallbackLink.map((l) => (
+                  <NavLink
+                    key={l.to}
+                    to={l.to}
+                    className={({ isActive }) =>
+                      `flex items-center gap-3 px-3 py-2 rounded-md text-sm ${isActive ? "bg-emerald-50 text-slate-900 font-semibold" : "text-slate-700 hover:bg-slate-50"}`
+                    }
+                  >
+                    <Icon name={l.icon} />
+                    <span>{l.label}</span>
+                  </NavLink>
+                ))}
+            </nav>
+
+            <div className="border-t border-slate-100 mt-4 pt-3">
+              <div className="flex items-center justify-between">
+                <div className="text-sm text-slate-700">Hi{user?.username ? `, ${user.username}` : ""}</div>
+                <button
+                  onClick={logout}
+                  className="px-3 py-1 rounded-full bg-rose-600 text-white text-sm font-medium hover:scale-[1.02] transition transform"
+                >
+                  Logout
+                </button>
+              </div>
+
+              <div className="mt-3 text-xs text-slate-500">
+                <div className="truncate">Signed in as: <span className="font-medium text-slate-700">{user?.email || "unknown"}</span></div>
+              </div>
+            </div>
+          </div>
         </div>
       </div>
     </header>
@@ -486,4 +627,10 @@ export default function App() {
        },
      };
    If you can't edit Tailwind config, those animations gracefully fall back to no-animation.
+
+   Responsiveness notes:
+   - Desktop (md+) shows full nav; mobile collapses to an accessible hamburger that opens a panel.
+   - Mobile menu auto-closes on navigation (useful on small screens).
+   - Brand/title uses truncation to avoid wrapping/pushing content on narrow widths.
+   - Tap targets, spacing and font sizes tuned for mobile.
 */

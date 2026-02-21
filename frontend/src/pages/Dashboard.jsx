@@ -1,18 +1,12 @@
 // src/pages/Dashboard.jsx
-import React, { useEffect, useState, useRef, useContext, useMemo } from "react";
+import React, { useEffect, useState, useRef, useMemo, useContext } from "react";
 import AuthContext from "../AuthContext";
 import api, { safeGet } from "../api";
 import PatrolMap from "../components/PatrolMap";
 import "leaflet/dist/leaflet.css";
 
-/*
-  Dashboard.jsx — styling-only update (animations, gradients, icons).
-  Functionality untouched.
-*/
-
 const HIGHLIGHT_MS = 2 * 60 * 1000;
 
-/* ---------- Decorative helpers ---------- */
 function Sparkle({ className = "" }) {
   return (
     <svg className={className} width="18" height="18" viewBox="0 0 24 24" fill="none" aria-hidden>
@@ -57,9 +51,7 @@ function SmallIcon({ name, className = "h-5 w-5" }) {
   }
 }
 
-/* ---------- KPI Component (styling only) ---------- */
 const KPI = ({ label, value, delta, color = "emerald" }) => {
-  // map color name to Tailwind utility fallbacks (keeps logic same)
   const colorMap = {
     emerald: { bg: "from-emerald-50 to-emerald-10", accent: "text-emerald-600", ring: "ring-emerald-100" },
     slate: { bg: "from-slate-50 to-slate-10", accent: "text-slate-700", ring: "ring-slate-100" },
@@ -95,7 +87,6 @@ const KPI = ({ label, value, delta, color = "emerald" }) => {
   );
 };
 
-/* ---------- Guard tile (styling only) ---------- */
 const GuardTile = ({ g, onClick, selected }) => (
   <div
     onClick={() => onClick && onClick(g)}
@@ -122,7 +113,6 @@ const GuardTile = ({ g, onClick, selected }) => (
   </div>
 );
 
-/* ---------- Modal (styling only) ---------- */
 function Modal({ open, onClose, children, title }) {
   if (!open) return null;
   return (
@@ -148,7 +138,6 @@ function Modal({ open, onClose, children, title }) {
   );
 }
 
-/* ---------- Main component: DashboardPage (logic unchanged) ---------- */
 export default function DashboardPage() {
   const { logout } = useContext(AuthContext);
 
@@ -239,7 +228,6 @@ export default function DashboardPage() {
     loadAll();
     const t = setInterval(loadAll, 15000);
     return () => clearInterval(t);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   function detectAssignmentsAndHighlight(newShifts) {
@@ -331,16 +319,10 @@ export default function DashboardPage() {
     } catch (e) {}
   }
 
-  const trend = (analytics?.attendance_last_7_days || []).map((d) => d.on_time ?? 0);
-
-  const statusParts = useMemo(() => {
-    const n = analytics?.workload?.length || 20;
-    return [
-      { value: Math.max(1, Math.round(0.6 * n)), color: "#06b6d4", label: "On Patrol" },
-      { value: Math.max(0, Math.round(0.2 * n)), color: "#f59e0b", label: "On Break" },
-      { value: Math.max(0, Math.round(0.2 * n)), color: "#ef4444", label: "Off Duty" },
-    ];
-  }, [analytics]);
+  // 30-day trend points
+  const trend30Points = (analytics?.attendance_last_30_days || []).map((d) => d.on_time || 0);
+  const monthlyCompliance = analytics?.monthly_compliance || [];
+  const trend7 = (analytics?.attendance_last_7_days || []).map((d) => d.on_time ?? 0);
 
   return (
     <div className="min-h-screen bg-gradient-to-b from-slate-50 to-slate-100">
@@ -388,20 +370,17 @@ export default function DashboardPage() {
           <div className="rounded-2xl p-4 shadow-xl border bg-white/60 backdrop-blur-sm">
             <div className="flex items-center justify-between">
               <div>
-                <div className="text-sm text-slate-500">Compliance (last 7 days)</div>
-                <div className="text-lg font-semibold text-slate-900 mt-1">{trend.length ? `${Math.round(trend.reduce((a, b) => a + b, 0) / Math.max(trend.length, 1))}%` : "—"}</div>
-                <div className="text-xs text-slate-400">avg on-time</div>
+                <div className="text-sm text-slate-500">Compliance (30 days)</div>
+                <div className="text-lg font-semibold text-slate-900 mt-1">{trend30Points.length ? `${Math.round(trend30Points.reduce((a, b) => a + b, 0) / Math.max(trend30Points.length, 1))}` : "—"}</div>
+                <div className="text-xs text-slate-400">avg daily on-time</div>
               </div>
               <div style={{ width: 200, height: 48 }} className="flex items-center">
                 <svg viewBox="0 0 200 48" width="200" height="48" className="overflow-visible">
-                  {trend && trend.length > 0 ? (() => {
-                    const width = 200,
-                      height = 48;
-                    const max = Math.max(...trend),
-                      min = Math.min(...trend),
-                      range = max - min || 1;
-                    const stepX = width / Math.max(trend.length - 1, 1);
-                    const d = trend.map((v, i) => `${i === 0 ? "M" : "L"} ${(i * stepX).toFixed(2)} ${(height - ((v - min) / range) * height).toFixed(2)}`).join(" ");
+                  {trend30Points && trend30Points.length > 0 ? (() => {
+                    const width = 200, height = 48;
+                    const max = Math.max(...trend30Points), min = Math.min(...trend30Points), range = max - min || 1;
+                    const stepX = width / Math.max(trend30Points.length - 1, 1);
+                    const d = trend30Points.map((v, i) => `${i === 0 ? "M" : "L"} ${(i * stepX).toFixed(2)} ${(height - ((v - min) / range) * height).toFixed(2)}`).join(" ");
                     return (
                       <>
                         <path d={d} stroke="#06b6d4" strokeWidth="2.4" fill="none" strokeLinecap="round" strokeLinejoin="round" />
@@ -490,6 +469,66 @@ export default function DashboardPage() {
             </div>
           </aside>
         </section>
+
+        <section className="mt-6">
+          <div className="bg-white rounded-3xl p-4 shadow-2xl border">
+            <div className="flex items-center justify-between mb-3">
+              <h3 className="font-semibold">Compliance (last 12 months)</h3>
+              <div className="text-xs text-slate-400">For audit / export</div>
+            </div>
+
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+              <div className="md:col-span-2">
+                <div className="space-y-2">
+                  {monthlyCompliance.length === 0 && <div className="text-sm text-slate-400 p-4 rounded">No monthly compliance data</div>}
+                  {monthlyCompliance.map((m, i) => (
+                    <div key={i} className="p-3 rounded-lg border flex items-center justify-between">
+                      <div>
+                        <div className="font-medium">{m.month_label}</div>
+                        <div className="text-xs text-slate-500">{m.on_time}/{m.total} on-time • {m.shifts_count} shifts</div>
+                      </div>
+                      <div className="text-right">
+                        <div className="font-semibold">{m.on_time_pct !== null ? `${m.on_time_pct}%` : "—"}</div>
+                        <div className="text-xs text-slate-400">absent: {m.absent}</div>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+
+                <div className="mt-3 flex gap-2">
+                  <button onClick={() => {
+                    // export CSV
+                    const rows = monthlyCompliance || [];
+                    if (!rows.length) return;
+                    const keys = ["month_label","year","month","on_time","late","total","shifts_count","absent","on_time_pct"];
+                    const csv = [keys.join(","), ...rows.map(r => keys.map(k => JSON.stringify(r[k] ?? "")).join(","))].join("\n");
+                    const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
+                    const url = URL.createObjectURL(blob);
+                    const a = document.createElement("a");
+                    a.href = url; a.download = "monthly_compliance.csv"; a.click(); URL.revokeObjectURL(url);
+                  }} className="px-3 py-2 rounded bg-emerald-600 text-white">Export CSV</button>
+
+                  <button onClick={() => { navigator.clipboard?.writeText(JSON.stringify(monthlyCompliance, null, 2)); }} className="px-3 py-2 rounded bg-slate-100">Copy JSON</button>
+                </div>
+              </div>
+
+              <div>
+                <div className="text-sm text-slate-500 mb-2">30-day on-time trend</div>
+                <div className="p-3 border rounded-lg bg-white">
+                  <svg viewBox="0 0 300 120" width="100%" height="120">
+                    {trend30Points && trend30Points.length > 0 ? (() => {
+                      const width = 300, height = 120;
+                      const max = Math.max(...trend30Points), min = Math.min(...trend30Points), range = max - min || 1;
+                      const stepX = width / Math.max(trend30Points.length - 1, 1);
+                      const d = trend30Points.map((v, i) => `${i === 0 ? "M" : "L"} ${(i * stepX).toFixed(2)} ${(height - ((v - min) / range) * height).toFixed(2)}`).join(" ");
+                      return <path d={d} stroke="#06b6d4" strokeWidth="2" fill="none" strokeLinecap="round" strokeLinejoin="round" />;
+                    })() : <text x="12" y="24" className="text-xs">no data</text>}
+                  </svg>
+                </div>
+              </div>
+            </div>
+          </div>
+        </section>
       </main>
 
       <Modal open={showGuardModal && !!selectedGuard} onClose={() => setShowGuardModal(false)} title={selectedGuard ? `${selectedGuard.full_name || selectedGuard.username}` : ""}>
@@ -572,20 +611,3 @@ export default function DashboardPage() {
     </div>
   );
 }
-
-/* ---------- Tailwind notes ----------
-If you'd like the floating/pulse animations used here to be smoother, add the following to your Tailwind config under theme.extend:
-
-animation: {
-  'spin-slow': 'spin 6s linear infinite',
-  'float': 'float 6s ease-in-out infinite',
-},
-keyframes: {
-  float: {
-    '0%,100%': { transform: 'translateY(0)' },
-    '50%': { transform: 'translateY(-6px)' },
-  },
-}
-
-You can also enable arbitrary variants if your purge is removing gradient utilities. Everything else uses standard Tailwind classes.
--------------------------------------- */

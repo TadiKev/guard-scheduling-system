@@ -40,6 +40,96 @@ export default function DashboardAnalytics() {
     }
   }
 
+  // ---------- Helpers to normalize workload objects ----------
+  function getGuardDisplayName(g) {
+    if (!g) return "Unknown";
+    // common fields
+    if (typeof g === "string") return g;
+    const maybe = (k) => {
+      if (g[k]) return g[k];
+      const alt = g[k.replace(/__/g, ".")];
+      if (alt) return alt;
+      return null;
+    };
+
+    const candidates = [
+      // backend variants
+      "guard__username",
+      "guard_username",
+      "username",
+      "user__username",
+      "user",
+      "name",
+      "full_name",
+      "display_name",
+    ];
+
+    for (const k of candidates) {
+      const v = maybe(k);
+      if (v && typeof v === "string" && v.trim() !== "") return v;
+      if (v && typeof v === "object") {
+        // e.g. user: { username: "..." }
+        if (typeof v.username === "string" && v.username.trim() !== "") return v.username;
+        if (typeof v.name === "string" && v.name.trim() !== "") return v.name;
+      }
+    }
+
+    // nested common shape: { guard: { username: "..." } }
+    if (g.guard && (g.guard.username || g.guard.name)) return g.guard.username || g.guard.name;
+    if (g.user && (g.user.username || g.user.name)) return g.user.username || g.user.name;
+
+    return "Unknown";
+  }
+
+  function getShiftsCount(g) {
+    if (!g) return 0;
+    // try common numeric fields (in order of preference)
+    const maybeNum = (v) => {
+      if (v == null) return null;
+      if (typeof v === "number") return v;
+      if (typeof v === "string") {
+        const n = parseInt(v, 10);
+        if (!Number.isNaN(n)) return n;
+      }
+      return null;
+    };
+
+    const numericFields = [
+      "shifts",
+      "checkins",
+      "count",
+      "total",
+      "shifts_count",
+      "shift_count",
+      "checkins_count",
+      "value",
+    ];
+
+    for (const f of numericFields) {
+      const v = maybeNum(g[f]);
+      if (v != null) return v;
+    }
+
+    // sometimes backend returns objects like { username: 'x', checks: 5 } or a single numeric prop
+    for (const k of Object.keys(g || {})) {
+      const v = maybeNum(g[k]);
+      if (v != null) return v;
+    }
+
+    return 0;
+  }
+
+  // safe accessors for top guard info
+  function topWorkloadInfo(workloadArray = []) {
+    if (!Array.isArray(workloadArray) || workloadArray.length === 0) return { name: "—", count: "—", sparkData: [] };
+    // assume the array is sorted by descending workload; if not, find the max
+    const top = workloadArray[0];
+    const name = getGuardDisplayName(top) || "Unknown";
+    const count = getShiftsCount(top);
+    const sparkData = (workloadArray || []).slice(0, 6).map((g) => getShiftsCount(g) || 0);
+    return { name, count, sparkData };
+  }
+
   if (loading) {
     return (
       <div className="p-6 bg-gradient-to-br from-white/80 to-slate-50 rounded-2xl shadow-lg">
@@ -60,14 +150,19 @@ export default function DashboardAnalytics() {
     );
   }
 
-  const attendance = analytics?.attendance_last_7_days || [];
+  // Normalize analytics shape (defensive defaults)
+  const attendance = (analytics && analytics.attendance_last_7_days) || [];
+  const workload = (analytics && analytics.workload) || [];
+
+  // Average on-time percent (rounded). Defensive against missing fields.
   const avgOnTime =
     attendance.length > 0
-      ? Math.round(attendance.reduce((a, b) => a + (b.on_time ?? 0), 0) / attendance.length)
+      ? Math.round(
+          attendance.reduce((acc, cur) => acc + (Number(cur?.on_time ?? 0) || 0), 0) / attendance.length
+        )
       : "—";
 
-  // top workload sanitized
-  const workload = analytics?.workload || [];
+  const topInfo = topWorkloadInfo(workload);
 
   return (
     <div className="space-y-6">
@@ -75,17 +170,17 @@ export default function DashboardAnalytics() {
       <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
         <SummaryCard
           title="Avg On-time (7d)"
-          value={`${avgOnTime}%`}
+          value={`${avgOnTime === "—" ? "—" : `${avgOnTime}%`}`}
           subtitle="Attendance punctuality"
           accent="green"
-          sparkData={attendance.map((d) => d.on_time ?? 0)}
+          sparkData={attendance.map((d) => Number(d.on_time ?? 0) || 0)}
         />
         <SummaryCard
           title="Top Guard Load"
-          value={workload?.length ? workload[0]?.shifts ?? "—" : "—"}
-          subtitle={workload?.length ? (workload[0]?.["guard__username"] || "Unknown") : "—"}
+          value={topInfo.count !== "—" ? topInfo.count : "—"}
+          subtitle={topInfo.name || "—"}
           accent="purple"
-          sparkData={(workload || []).slice(0, 6).map((g) => g.shifts || 0)}
+          sparkData={topInfo.sparkData}
         />
         <div className="bg-white rounded-2xl shadow p-4">
           <div className="flex items-start justify-between">
@@ -136,10 +231,7 @@ export default function DashboardAnalytics() {
               <CartesianGrid strokeDasharray="3 3" stroke="#f1f5f9" />
               <XAxis dataKey="date" tick={{ fontSize: 12, fill: "#475569" }} />
               <YAxis tick={{ fontSize: 12, fill: "#475569" }} />
-              <Tooltip
-                contentStyle={{ borderRadius: 8, borderColor: "#f1f5f9" }}
-                itemStyle={{ color: "#0f172a" }}
-              />
+              <Tooltip contentStyle={{ borderRadius: 8, borderColor: "#f1f5f9" }} itemStyle={{ color: "#0f172a" }} />
               <Legend verticalAlign="top" height={36} />
 
               <Line
@@ -172,21 +264,26 @@ export default function DashboardAnalytics() {
         <div className="bg-white rounded-2xl p-4 shadow">
           <h3 className="font-semibold mb-3">Guard workload (top)</h3>
           <div className="space-y-2">
-            {(analytics.workload || []).slice(0, 8).map((g, i) => (
-              <div key={i} className="flex items-center justify-between p-3 rounded-lg hover:bg-slate-50 transition">
-                <div className="flex items-center gap-3">
-                  <div className="w-10 h-10 rounded-md flex items-center justify-center bg-gradient-to-br from-indigo-500 to-indigo-300 text-white font-bold">
-                    {String(g["guard__username"] || "U").slice(0, 2).toUpperCase()}
+            {(workload || []).slice(0, 8).map((g, i) => {
+              const name = getGuardDisplayName(g);
+              const shifts = getShiftsCount(g);
+              const avatarText = String((name && name !== "Unknown" ? name : "U").slice(0, 2)).toUpperCase();
+              return (
+                <div key={i} className="flex items-center justify-between p-3 rounded-lg hover:bg-slate-50 transition">
+                  <div className="flex items-center gap-3">
+                    <div className="w-10 h-10 rounded-md flex items-center justify-center bg-gradient-to-br from-indigo-500 to-indigo-300 text-white font-bold">
+                      {avatarText}
+                    </div>
+                    <div>
+                      <div className="font-medium text-slate-800">{name}</div>
+                      <div className="text-xs text-slate-400">Shifts: {shifts}</div>
+                    </div>
                   </div>
-                  <div>
-                    <div className="font-medium text-slate-800">{g["guard__username"] || "Unknown"}</div>
-                    <div className="text-xs text-slate-400">Shifts: {g.shifts}</div>
-                  </div>
+                  <div className="text-sm text-slate-600">{shifts}</div>
                 </div>
-                <div className="text-sm text-slate-600">{g.shifts}</div>
-              </div>
-            ))}
-            {(analytics.workload || []).length === 0 && <div className="text-sm text-slate-400 p-3">No workload data</div>}
+              );
+            })}
+            {(workload || []).length === 0 && <div className="text-sm text-slate-400 p-3">No workload data</div>}
           </div>
         </div>
 
@@ -195,13 +292,13 @@ export default function DashboardAnalytics() {
           <div className="space-y-3">
             <div className="p-3 rounded-lg bg-slate-50">
               <div className="text-sm text-slate-500">Average on-time (7 days)</div>
-              <div className="text-xl font-bold text-emerald-700 mt-1">{avgOnTime}%</div>
-              <div className="mt-2"><SparklineCard data={attendance.map(d => d.on_time ?? 0)} /></div>
+              <div className="text-xl font-bold text-emerald-700 mt-1">{avgOnTime === "—" ? "—" : `${avgOnTime}%`}</div>
+              <div className="mt-2"><SparklineCard data={attendance.map(d => Number(d.on_time ?? 0) || 0)} /></div>
             </div>
 
             <div className="p-3 rounded-lg bg-slate-50">
               <div className="text-sm text-slate-500">Total guards monitored</div>
-              <div className="text-xl font-bold text-slate-900 mt-1">{analytics.total_guards ?? "—"}</div>
+              <div className="text-xl font-bold text-slate-900 mt-1">{analytics?.total_guards ?? "—"}</div>
             </div>
           </div>
         </div>
